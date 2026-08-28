@@ -1,0 +1,11 @@
+numpy
+requests
+tqdm
+faiss-cpu
+rank-bm25
+opencv-python
+nbformat
+torch 
+torchvision 
+transformers 
+openai
