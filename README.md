@@ -165,18 +165,18 @@ New queries can be entered by modifying the PROMPT variable.
 
 ## Architecture Decisions 
 
-1. Hierarchical chunking: I used multi-scale video chunks because large chunks preserve the context needed to understand an event while smaller chunks provide more accurate timestamps, giving the system both efficient search and precise localization. 
-2. Separate retrieval channels: I kept video, transcript, metadata, and OCR retrieval separate because each modality captures different information, allowing the system to route a query toward the strongest source instead of forcing every query through one model. 
-3. FAISS semantic search: I used FAISS because it can search large collections of embedding vectors much faster than directly comparing a text query against every stored video chunk.
-4. Semantic search + BM25: I combined embedding-based semantic search with BM25 because embeddings are better at finding conceptually similar content while BM25 is more reliable for exact words, names, or phrases that may otherwise be missed.
-5. Evidence-based ranking: I combined evidence from multiple retrieval methods because agreement between video, transcript, and metadata signals is generally more reliable than selecting a result based on one similarity score alone.
-6. Zero-shot pretrained models: I relied on pretrained foundation models because this avoids the need for a labeled training dataset and allows the same system to handle many different types of videos and natural-language queries.
-7. Recursive refinement: I refined high-scoring coarse intervals into smaller child chunks because this avoids performing expensive fine-grained search across the entire video while still producing precise start and end timestamps.
-8. Cached preprocessing: I saved embeddings, metadata, transcripts, and search indexes because most of this information does not change between queries, making repeated searches over the same video significantly faster.
-9. Query planning: I used a query planner to break a natural-language request into modality-specific searches because different parts of a query may require visual, transcript, OCR, or temporal evidence.
-10. Temporal evidence aggregation: I mapped retrieval results back onto a shared video timeline because overlapping evidence from different sources makes it easier to identify the sections where an event is most likely to occur.
-11. Final verification: I added a verification stage because retrieval models can return clips that are semantically related but do not actually contain the requested event, so checking the strongest candidates helps reduce false positives.
-12. Separate preprocessing and retrieval: I separated the expensive video-processing stage from query-time retrieval so the video only needs to be indexed once, after which many different user queries can be answered efficiently.
+1. **Hierarchical chunking:** I used multi-scale video chunks because large chunks preserve the context needed to understand an event while smaller chunks provide more accurate timestamps, giving the system both efficient search and precise localization.
+2. **Separate retrieval channels:** I kept video, transcript, metadata, and OCR retrieval separate because each modality captures different information, allowing the system to route a query toward the strongest source instead of forcing every query through one model.
+3. **FAISS semantic search:** I used FAISS because it can search large collections of embedding vectors much faster than directly comparing a text query against every stored video chunk.
+4. **Semantic search + BM25:** I combined embedding-based semantic search with BM25 because embeddings are better at finding conceptually similar content while BM25 is more reliable for exact words, names, or phrases that may otherwise be missed.
+5. **Evidence-based ranking:** I combined evidence from multiple retrieval methods because agreement between video, transcript, and metadata signals is generally more reliable than selecting a result based on one similarity score alone.
+6. **Zero-shot pretrained models:** I relied on pretrained foundation models because this avoids the need for a labeled training dataset and allows the same system to handle many different types of videos and natural-language queries.
+7. **Recursive refinement:** I refined high-scoring coarse intervals into smaller child chunks because this avoids performing expensive fine-grained search across the entire video while still producing precise start and end timestamps.
+8. **Cached preprocessing:** I saved embeddings, metadata, transcripts, and search indexes because most of this information does not change between queries, making repeated searches over the same video significantly faster.
+9. **Query planning:** I used a query planner to break a natural-language request into modality-specific searches because different parts of a query may require visual, transcript, OCR, or temporal evidence.
+10. **Temporal evidence aggregation:** I mapped retrieval results back onto a shared video timeline because overlapping evidence from different sources makes it easier to identify the sections where an event is most likely to occur.
+11. **Final verification:** I added a verification stage because retrieval models can return clips that are semantically related but do not actually contain the requested event, so checking the strongest candidates helps reduce false positives.
+12. **Separate preprocessing and retrieval:** I separated the expensive video-processing stage from query-time retrieval so the video only needs to be indexed once, after which many different user queries can be answered efficiently.
 
 ## What I Tried
 1. I initially tried implementing just single chunks, but it was difficult to determine the optimal length of the chunk that would capture as much information as possible. Thus, I decided to use hierarchical chunking instead. 
@@ -191,7 +191,7 @@ New queries can be entered by modifying the PROMPT variable.
 4. Generalized vs Specialized Inference: Since I used pretrained models, I didn't have to annotate any data specifically or retrain any models, which can be costly. However, training more specialized models could yield better performance. 
 
 ## Future Works
-1. Improve OCR: Build a more robust video OCR pipeline using text detection, frame enhancement, multi-frame aggregation, and tracking to better recognize small or blurry text such as license plates and signs.
-2. Add stronger temporal reasoning: Extend the query planner to understand relationships such as before, after, during, and then, through analyzing more video chunks,  allowing the system to handle queries involving sequences of multiple events.
-3. Improve ranking and score calibration: Tune or learn how much weight to give video, transcript, metadata, OCR, and BM25 evidence for each query instead of relying mainly on manually selected scoring rules.
-4. Build an annotated formal evaluation benchmark to evaluate model performance
+1. **Improve OCR:** Build a more robust video OCR pipeline using text detection, frame enhancement, multi-frame aggregation, and tracking to better recognize small or blurry text such as license plates and signs.
+2. **Add stronger temporal reasoning:** Extend the query planner to understand relationships such as before, after, during, and then by analyzing more video chunks, allowing the system to handle queries involving sequences of multiple events.
+3. **Improve ranking and score calibration:** Tune or learn how much weight to give video, transcript, metadata, OCR, and BM25 evidence for each query instead of relying mainly on manually selected scoring rules.
+4. **Build an annotated formal evaluation benchmark:** Create a labeled benchmark with ground-truth timestamps and query-event pairs to systematically evaluate retrieval accuracy, temporal localization, and overall system performance.
