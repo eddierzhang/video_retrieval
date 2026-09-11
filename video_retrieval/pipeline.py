@@ -1,9 +1,11 @@
-#Pipelien for video retieval
+#Pipeline for video retrieval
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
+from . import local_backend
+from .local_backend import LocalModels, use_models
 from .retrieval import (
     build_temporal_evidence_map,
     candidates_from_evidence_map,
@@ -16,6 +18,19 @@ from .retrieval import (
 from .visual_text import run_visual_text_extraction
 from .verification import refine_instances, temporal_nms, verify_candidates_flash, verify_instances_pro
 from .video import materialize_final_matches
+
+# Stage messages reported while a search runs, in order. Visual-text queries report
+# "Planning query", "Reading visible text", then "Extracting matching clips".
+SEARCH_STAGES = [
+    "Planning query",
+    "Searching visual, scene, and speech indexes",
+    "Building evidence timeline",
+    "Finding candidate moments",
+    "Verifying candidates with the vision model",
+    "Confirming matches with the verifier model",
+    "Refining clip boundaries",
+    "Extracting matching clips",
+]
 
 
 @dataclass
@@ -36,14 +51,12 @@ class VideoRetrievalPipeline:
     def __init__(self, resources: RetrievalResources):
         self.resources = resources
 
-    def retrieve(self, query: str, **kwargs):
-        if self.resources.local_models is not None:
-            from .local_backend import use_local
-            with use_local(self.resources.local_models):
-                result = retrieve_video(query=query, resources=self.resources, **kwargs)
-                result['model_backend'] = self.resources.local_models.signature()
-                return result
-        return retrieve_video(query=query, resources=self.resources, **kwargs)
+    def retrieve(self, query: str, reporter=None, cancel_event=None, **kwargs):
+        models = self.resources.local_models or LocalModels()
+        with use_models(models, reporter, cancel_event):
+            result = retrieve_video(query=query, resources=self.resources, **kwargs)
+        result["model_backend"] = models.signature()
+        return result
 
 #Method to retrieve the actual video. Each final match contains precise timestamps, a matching clip, and matching frame paths extracted from the original source video.
 def retrieve_video(
@@ -68,6 +81,7 @@ def retrieve_video(
     flash_min_confidence=0.10,
     pro_min_confidence=0.25,
     run_pro_verification=True,
+    run_verification=True,
     refine_boundaries=True,
     refinement_stages=(8.0, 4.0, 2.0),
     nms_iou_threshold=0.55,
@@ -95,11 +109,12 @@ def retrieve_video(
     transcript_metadata = resources.transcript_metadata
 
     # 1. Query planning
+    local_backend.stage("Planning query")
     plan = plan_query(query)
     return_mode = plan.get("return_mode", "all")
 
     if plan.get("executor") == "visual_text_extraction":
-        print("Started OCR")
+        local_backend.stage("Reading visible text")
         result = run_visual_text_extraction(
             manifest,
             query=query,
@@ -125,6 +140,7 @@ def retrieve_video(
         return result
 
     # 2. High-recall multimodal retrieval
+    local_backend.stage("Searching visual, scene, and speech indexes")
     retrieval_results = run_retrieval_plan(
         plan,
         video_index,
@@ -138,6 +154,7 @@ def retrieve_video(
     )
 
     # 3. Temporal Evidence/Possible Occurence Map
+    local_backend.stage("Building evidence timeline")
     fused = fuse_retrieval_results(
         retrieval_results,
         plan,
@@ -163,6 +180,7 @@ def retrieve_video(
             "num_matches": 0,
             "matches": [],
         }
+    local_backend.stage("Finding candidate moments")
     if candidate_relative_score_floor is None:
         candidate_relative_score_floor = 0.05 if return_mode == "all" else 0.15
 
@@ -209,77 +227,70 @@ def retrieve_video(
         candidates = candidates[:max_candidates]
 
     
-    # 6. Gemini Flash to Narrow Candidates 
-    instances = verify_candidates_flash(
-        manifest,
-        candidates,
-        query,
-        plan=plan,
-        min_confidence=flash_min_confidence,
-    )
-    flash_instance_count = len(instances)
+    diagnostics = {
+        "num_fused_bins": len(fused),
+        "num_evidence_bins": len(evidence_map),
+        "evidence_peak_score": evidence_peak,
+        "num_initial_candidates": len(initial_candidates),
+        "num_candidates": len(candidates),
+    }
 
-    if not instances:
-        result = {
-            "query": query,
-            "plan": plan,
-            "num_matches": 0,
-            "matches": [],
-        }
-        if include_diagnostics:
-            result["diagnostics"] = {
-                "num_evidence_bins": len(evidence_map),
-                "evidence_peak_score": evidence_peak,
-                "num_initial_candidates": len(initial_candidates),
-                "num_candidates": len(candidates),
-                "num_flash_instances": 0,
-            }
-            if include_evidence_map:
-                result["diagnostics"]["evidence_map"] = evidence_map
-        return result
-
-    
-    # 7. Gemini Pro Candidate Filtering for False Positives 
-    if run_pro_verification:
-        instances = verify_instances_pro(
+    if run_verification:
+        # 6. First vision-model pass finds every occurrence inside each candidate
+        local_backend.stage("Verifying candidates with the vision model")
+        instances = verify_candidates_flash(
             manifest,
-            instances,
+            candidates,
             query,
             plan=plan,
-            min_confidence=pro_min_confidence,
+            min_confidence=flash_min_confidence,
         )
+        diagnostics["num_flash_instances"] = len(instances)
 
-    if not instances:
-        result = {
-            "query": query,
-            "plan": plan,
-            "num_matches": 0,
-            "matches": [],
-        }
-        if include_diagnostics:
-            result["diagnostics"] = {
-                "num_evidence_bins": len(evidence_map),
-                "evidence_peak_score": evidence_peak,
-                "num_initial_candidates": len(initial_candidates),
-                "num_candidates": len(candidates),
-                "num_flash_instances": flash_instance_count,
-                "num_pro_instances": 0,
+        # 7. Stricter second pass filters false positives
+        if instances and run_pro_verification:
+            local_backend.stage("Confirming matches with the verifier model")
+            instances = verify_instances_pro(
+                manifest,
+                instances,
+                query,
+                plan=plan,
+                min_confidence=pro_min_confidence,
+            )
+            diagnostics["num_pro_instances"] = len(instances)
+
+        diagnostics["num_pre_refine_instances"] = len(instances)
+
+        if return_mode == "best" and instances:
+            # Refinement never changes confidence and NMS always keeps the most confident
+            # occurrence, so the final best event is already known; refine only that one.
+            instances = [
+                max(instances, key=lambda x: float(x.get("confidence", 0.0)))
+            ]
+
+        # 8. Coarse-to-fine boundary refinement PER occurrence
+        if instances and refine_boundaries:
+            local_backend.stage("Refining clip boundaries")
+            instances = refine_instances(
+                manifest,
+                instances,
+                query,
+                plan=plan,
+                stages=refinement_stages,
+            )
+    else:
+        # Retrieval-only search: rank evidence candidates without vision-model checks.
+        instances = [
+            {
+                "start": float(candidate["start"]),
+                "end": float(candidate["end"]),
+                "confidence": float(candidate.get("score", 0.0)),
+                "description": "Candidate moment ranked by retrieval evidence (not verified)",
+                "source_candidate_id": candidate.get("candidate_id"),
+                "retrieval_score": float(candidate.get("score", 0.0)),
             }
-            if include_evidence_map:
-                result["diagnostics"]["evidence_map"] = evidence_map
-        return result
-
-    pre_refine_instances = [x.copy() for x in instances]
-
-    # 8. Coarse-to-fine boundary refinement PER occurrence
-    if refine_boundaries:
-        instances = refine_instances(
-            manifest,
-            instances,
-            query,
-            plan=plan,
-            stages=refinement_stages,
-        )
+            for candidate in candidates
+        ]
 
     # 9. Temporal NMS / overlap deduplication
     instances = temporal_nms(
@@ -295,6 +306,7 @@ def retrieve_video(
         ]
 
     # 10. Extract FINAL matching clip + frames from original video
+    local_backend.stage("Extracting matching clips")
     matches, result_file = materialize_final_matches(
         manifest,
         instances,
@@ -307,31 +319,23 @@ def retrieve_video(
     result = {
         "query": query,
         "plan": plan,
+        "verified": bool(run_verification),
         "num_matches": len(matches),
         "matches": matches,
         "results_file": str(result_file),
     }
 
     if include_diagnostics:
-        top_evidence_bins = sorted(
+        diagnostics["num_final_matches"] = len(matches)
+        diagnostics["top_evidence_bins"] = sorted(
             evidence_map,
             key=lambda row: float(row.get("score", 0.0)),
             reverse=True,
         )[:20]
-        result["diagnostics"] = {
-            "num_fused_bins": len(fused),
-            "num_evidence_bins": len(evidence_map),
-            "evidence_peak_score": evidence_peak,
-            "top_evidence_bins": top_evidence_bins,
-            "num_initial_candidates": len(initial_candidates),
-            "num_candidates": len(candidates),
-            "num_flash_instances": flash_instance_count,
-            "num_pre_refine_instances": len(pre_refine_instances),
-            "num_final_matches": len(matches),
-            "initial_candidates": initial_candidates,
-            "candidates": candidates,
-        }
+        diagnostics["initial_candidates"] = initial_candidates
+        diagnostics["candidates"] = candidates
         if include_evidence_map:
-            result["diagnostics"]["evidence_map"] = evidence_map
+            diagnostics["evidence_map"] = evidence_map
+        result["diagnostics"] = diagnostics
 
     return result

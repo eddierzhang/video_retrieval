@@ -1,12 +1,19 @@
+# Everything runs locally. For NVIDIA GPU acceleration of CLIP and Whisper, install the
+# CUDA 12.6 PyTorch build before these requirements:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
 numpy
+opencv-python
+pillow
 requests
 tqdm
+jsonschema
 faiss-cpu
 rank-bm25
-opencv-python
+av
+torch>=2.6
+transformers>=4.50,<5
+faster-whisper>=1.1,<2
+starlette>=0.40
+uvicorn>=0.30
+python-multipart
 nbformat
-torch 
-torchvision 
-transformers 
-openai
-jsonschema

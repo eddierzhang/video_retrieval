@@ -1,7 +1,6 @@
 #Video chunking and utilities for temporal search.
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import math
@@ -13,24 +12,40 @@ import numpy as np
 from tqdm import tqdm
 
 
-#Get video duration in seconds using ffprobe.
-def get_video_duration(video_path):
-    video_path = Path(video_path)
-
+#Probe duration, frame size, and codecs with ffprobe.
+def probe_video(video_path):
     result = subprocess.run(
         [
             "ffprobe",
             "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-show_entries", "format=duration,format_name:stream=codec_type,codec_name,width,height",
+            "-of", "json",
             str(video_path),
         ],
         capture_output=True,
         text=True,
         check=True,
     )
+    data = json.loads(result.stdout)
+    streams = data.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
+    try:
+        duration = float(data.get("format", {}).get("duration"))
+    except (TypeError, ValueError):
+        duration = 0.0
+    return {
+        "duration": duration,
+        "format": data.get("format", {}).get("format_name", ""),
+        "width": int(video.get("width") or 0),
+        "height": int(video.get("height") or 0),
+        "video_codec": video.get("codec_name"),
+        "audio_codec": audio.get("codec_name"),
+    }
 
-    return float(result.stdout.strip())
+#Get video duration in seconds using ffprobe.
+def get_video_duration(video_path):
+    return probe_video(video_path)["duration"]
 
 # Generate multiple overlapping [start, end] windows.
 def generate_windows(
@@ -362,164 +377,6 @@ def materialize_chunk(
     return output_path
 
 
-#Creates clip for Gemini Embedding Model
-def materialize_embedding_clip(
-    manifest,
-    chunk,
-    output_dir="embedding_cache",
-    width=640,
-    crf=24,
-):
-    """
-    Create a lightweight video specifically for Gemini Embedding 2.
-
-    - 1 FPS because Gemini Embedding 2 samples <=32s clips at 1 FPS
-    - removes audio because Gemini Embedding 2 ignores video audio
-    - scales video to <=640 px wide
-    - H.264 compression
-    """
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    output_path = (
-        output_dir /
-        f"{chunk['chunk_id']}_embed.mp4"
-    )
-
-    # Reuse cached file
-    if output_path.exists():
-        return output_path
-
-    source_video = manifest["video"]["path"]
-
-    start = chunk["start"]
-    duration = chunk["duration"]
-
-    command = [
-        "ffmpeg",
-        "-y",
-
-        # Seek
-        "-ss", str(start),
-
-        "-i", str(source_video),
-
-        # Clip duration
-        "-t", str(duration),
-
-        # Gemini only needs sparse frames anyway
-        "-vf",
-        f"fps=1,scale='min({width},iw)':-2",
-
-        # Remove audio
-        "-an",
-
-        # Compress
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", str(crf),
-
-        # Widely compatible output
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-
-        str(output_path),
-    ]
-
-    subprocess.run(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        check=True,
-    )
-
-    size_mb = output_path.stat().st_size / (1024 ** 2)
-
-    print(
-        f"{chunk['chunk_id']}: "
-        f"{size_mb:.2f} MB "
-        f"(~{size_mb * 4/3:.2f} MB base64)"
-    )
-
-    return output_path
-
-#Creates clip for metadata extraction/captioning
-def materialize_metadata_clip(
-    manifest,
-    chunk,
-    output_dir="metadata_video_cache",
-    fps=4,
-    width=768,
-    crf=25,
-):
-    """
-    Create a lightweight but motion-preserving clip
-    for VLM metadata extraction.
-
-    This is different from the 1-FPS embedding proxy.
-    """
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    output_path = (
-        output_dir /
-        f"{chunk['chunk_id']}_metadata.mp4"
-    )
-
-    # Cache
-    if output_path.exists():
-        return output_path
-
-    source_video = manifest["video"]["path"]
-
-    command = [
-        "ffmpeg",
-        "-y",
-
-        "-ss", str(chunk["start"]),
-        "-i", str(source_video),
-
-        "-t", str(chunk["duration"]),
-
-        "-vf",
-        f"fps={fps},scale={width}:-2:force_original_aspect_ratio=decrease",
-
-        # Audio retrieval will be a different module
-        "-an",
-
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", str(crf),
-
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-
-        str(output_path),
-    ]
-
-    result = subprocess.run(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            result.stderr.decode(
-                "utf-8",
-                errors="ignore"
-            )
-        )
-
-    return output_path
-
-
-
 def _safe_stem(text):
     text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text))
     return text[:80] or "video"
@@ -650,110 +507,6 @@ def materialize_candidates(
 
     return output
 
-# Local video file into base64 URL for OpenRouter API 
-def video_to_data_url(video_path):
-    video_path = Path(video_path)
-    mime_types = {
-        ".mp4": "video/mp4",
-        ".mov": "video/quicktime",
-        ".webm": "video/webm",
-        ".mpeg": "video/mpeg",
-        ".mpg": "video/mpeg",
-    }
-    suffix = video_path.suffix.lower()
-    if suffix not in mime_types:
-        raise ValueError(f"Unsupported video format: {suffix}")
-    encoded = base64.b64encode(video_path.read_bytes()).decode("utf-8")
-    return f"data:{mime_types[suffix]};base64,{encoded}"
-
-#Extracts verifier video
-def materialize_vlm_clip(
-    manifest,
-    start,
-    end,
-    output_dir="vlm_clip_cache",
-    fps=4,
-    width=768,
-    crf=26,
-    include_audio=True,
-    max_raw_mb=5.5,
-):
-
-    start = max(0.0, float(start))
-    end = min(float(manifest["video"]["duration"]), float(end))
-    if end <= start:
-        raise ValueError("Invalid VLM interval")
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    source = manifest["video"]["path"]
-    key = interval_cache_key(manifest, start, end, prefix="vlm")
-    output_path = output_dir / f"{key}.mp4"
-
-    if output_path.exists():
-        size_mb = output_path.stat().st_size / (1024 ** 2)
-        if size_mb <= max_raw_mb:
-            return output_path
-
-    # Progressively cheaper encodes if a long/complex clip is too large.
-    attempts = [
-        (fps, width, crf),
-        (min(fps, 3), min(width, 640), max(crf, 28)),
-        (min(fps, 2), min(width, 512), max(crf, 30)),
-        (1, min(width, 448), max(crf, 32)),
-    ]
-
-    last_size = None
-
-    for attempt_fps, attempt_width, attempt_crf in attempts:
-        vf = (
-            f"fps={attempt_fps},"
-            f"scale='min({int(attempt_width)},iw)':-2"
-        )
-
-        command = [
-            "ffmpeg", "-y",
-            "-ss", f"{start:.3f}",
-            "-i", str(source),
-            "-t", f"{end - start:.3f}",
-            "-map", "0:v:0",
-            "-vf", vf,
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", str(attempt_crf),
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-        ]
-
-        if include_audio:
-            command += [
-                "-map", "0:a?",
-                "-c:a", "aac",
-                "-b:a", "64k",
-            ]
-        else:
-            command += ["-an"]
-
-        command.append(str(output_path))
-
-        result = subprocess.run(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.decode("utf-8", errors="ignore"))
-
-        last_size = output_path.stat().st_size / (1024 ** 2)
-        if last_size <= max_raw_mb:
-            return output_path
-
-    raise RuntimeError(
-        f"Verifier clip is still {last_size:.2f} MB after compression. "
-        "Reduce verifier_window_seconds or max_raw_mb."
-    )
 
 #Extract one clip from the original video 
 def extract_final_clip(

@@ -31,5 +31,4 @@ __all__ = [
     "consensus_ocr_text",
     "run_visual_text_extraction",
     "run_visual_ocr",
-    "run_license_plate_ocr",
 ]

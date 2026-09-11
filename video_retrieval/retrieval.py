@@ -3,12 +3,8 @@ from __future__ import annotations
 
 from . import local_backend
 
-import json
 import math
 
-import requests
-
-from .config import OPENROUTER_CHAT_URL, QUERY_PLANNER_MODEL, get_openrouter_api_key
 from .embeddings import search_video
 from .metadata import search_metadata
 from .transcript import search_transcript_bm25, search_transcript_semantic
@@ -275,45 +271,7 @@ General planning rules:
         "additionalProperties": False,
     }
 
-    payload = {
-        "model": QUERY_PLANNER_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "retrieval_plan",
-                "strict": True,
-                "schema": schema,
-            },
-        },
-        "provider": {"require_parameters": True},
-        "temperature": 0,
-    }
-
-    if local_backend.active():
-        plan = local_backend.chat_json(prompt + "\nPlan only this user request: " + query, schema, role="planner")
-    else:
-        headers = {
-            "Authorization": f"Bearer {get_openrouter_api_key()}",
-            "Content-Type": "application/json",
-        }
-
-        #Call the planner
-        response = requests.post(
-            OPENROUTER_CHAT_URL,
-            headers=headers,
-            json=payload,
-            timeout=120,
-        )
-
-        if not response.ok:
-            raise RuntimeError(
-                f"Query planning failed: HTTP {response.status_code}\n"
-                f"{response.text}"
-            )
-
-        content = response.json()["choices"][0]["message"]["content"]
-        plan = json.loads(content)
+    plan = local_backend.chat_json(prompt + "\nPlan only this user request: " + query, schema, role="planner")
 
     #Type of query
     if plan.get("executor") == "visual_text_extraction":
@@ -756,7 +714,6 @@ def _smooth_series(values, radius=1):
             weight_sum += weight
         output.append(weighted_sum / weight_sum if weight_sum else values[i])
     return output
-
 
 
     # Each retrieval query first receives its own 0..1 map. Overlapping hits from the

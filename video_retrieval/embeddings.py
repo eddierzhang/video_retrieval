@@ -3,110 +3,19 @@ from __future__ import annotations
 from . import local_backend
 
 import json
-import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-import requests
-from tqdm import tqdm
 
-from .config import (
-    EMBEDDING_DIM,
-    EMBEDDING_MODEL,
-    OPENROUTER_EMBEDDING_URL,
-    get_openrouter_api_key,
-)
-from .video import materialize_embedding_clip, video_to_data_url
+#Embed text into the CLIP space shared with video chunks.
+def embed_text(text):
+    return local_backend.embed_text(text)
 
-#Embed text with the configured multimodal embedding model through OpenRouter.
-def embed_text(text, input_type=None):
-    if local_backend.active():
-        return local_backend.embed_text(text)
-    payload = {
-        "model": EMBEDDING_MODEL,
-        "input": text,
-        "dimensions": EMBEDDING_DIM,
-        "encoding_format": "float",
-    }
-    if input_type is not None:
-        payload["input_type"] = input_type
+#Embed one interval of the source video as the mean of its CLIP frame embeddings.
+def embed_video_interval(video_path, start, end):
+    return local_backend.embed_video_interval(video_path, start, end)
 
-    headers = {
-        "Authorization": f"Bearer {get_openrouter_api_key()}",
-        "Content-Type": "application/json",
-    }
-    response = requests.post(
-        OPENROUTER_EMBEDDING_URL,
-        headers=headers,
-        json=payload,
-        timeout=120,
-    )
-    if not response.ok:
-        raise RuntimeError(
-            f"Text embedding failed:\nHTTP {response.status_code}\n{response.text}"
-        )
-
-    return np.asarray(
-        response.json()["data"][0]["embedding"],
-        dtype=np.float32,
-    )
-
-#Embed one reconstructed video chunk with the same multimodal model as text.
-def embed_video(video_path):
-    if local_backend.active():
-        return local_backend.embed_video(video_path)
-    video_path = Path(video_path)
-    raw_size_mb = video_path.stat().st_size / (1024 ** 2)
-
-
-    print(f"Video size: {raw_size_mb:.2f} MB")
-
-    video_data_url = video_to_data_url(video_path)
-
-    payload = {
-        "model": EMBEDDING_MODEL,
-        "input": [
-            {
-                "content": [
-                    {
-                        "type": "input_video",
-                        "input_video": {
-                            "data": video_data_url,
-                            "format": "mp4",
-                        },
-                    }
-                ]
-            }
-        ],
-        "dimensions": EMBEDDING_DIM,
-        "encoding_format": "float",
-    }
-
-    headers = {
-        "Authorization": f"Bearer {get_openrouter_api_key()}",
-        "Content-Type": "application/json",
-    }
-
-    response = requests.post(
-        OPENROUTER_EMBEDDING_URL,
-        headers=headers,
-        json=payload,
-        timeout=300,
-    )
-
-    if not response.ok:
-        raise RuntimeError(
-            "Video embedding failed:\n"
-            f"HTTP {response.status_code}\n"
-            f"{response.text}"
-        )
-
-    result = response.json()
-    return np.asarray(
-        result["data"][0]["embedding"],
-        dtype=np.float32,
-    )
 
 #Return an L2-normalized float32 vector.
 def normalize_embedding(x):
@@ -289,56 +198,24 @@ def infer_hierarchy_links(
 
     return output
 
-#Embed every video chunk at one scale and persist vectors + timestamp metadata. Preserves parent/child data from manifest 
+#Embed every video chunk at one scale and persist vectors + timestamp metadata. Preserves parent/child data from manifest
 def embed_scale(
     manifest,
     scale="medium",
-    cache_dir="embedding_video_cache",
     save_dir="embedding_indices",
-    retry_count=3,
 ):
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    chunks = manifest["chunks"][scale]
-
+    video_path = manifest["video"]["path"]
     embeddings = []
     metadata = []
 
-    for chunk in tqdm(
-        chunks,
-        desc=f"Embedding {scale} chunks",
-    ):
-        clip_path = materialize_embedding_clip(
-            manifest=manifest,
-            chunk=chunk,
-            output_dir=cache_dir,
-        )
-
-        success = False
-
-        for attempt in range(retry_count):
-            try:
-                vector = embed_video(clip_path)
-                vector = normalize_embedding(vector)
-                success = True
-                break
-
-            except Exception as exc:
-                print(f"\nError on {chunk['chunk_id']}: {exc}")
-
-                if attempt < retry_count - 1:
-                    time.sleep(2 ** attempt)
-
-        if not success:
-            print("Skipping", chunk["chunk_id"])
-            continue
-
-        embeddings.append(vector)
-
+    for chunk in local_backend.track(manifest["chunks"][scale], f"Embedding {scale} chunks"):
         start = float(chunk["start"])
         end = float(chunk["end"])
 
+        embeddings.append(embed_video_interval(video_path, start, end))
         metadata.append(
             {
                 "chunk_id": chunk["chunk_id"],
@@ -752,9 +629,7 @@ def build_multiscale_video_index(
 def embed_all_scales(
     manifest,
     scales=None,
-    cache_dir="embedding_video_cache",
     save_dir="embedding_indices",
-    retry_count=3,
     build_individual_faiss=True,
     **hierarchy_kwargs,
 ):
@@ -782,9 +657,7 @@ def embed_all_scales(
         embeddings, metadata = embed_scale(
             manifest=manifest,
             scale=scale,
-            cache_dir=cache_dir,
             save_dir=save_dir,
-            retry_count=retry_count,
         )
 
         embeddings_by_scale[scale] = embeddings

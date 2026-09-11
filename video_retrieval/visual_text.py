@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from . import local_backend
 
-import base64
 import hashlib
 import json
 import math
@@ -15,11 +14,9 @@ from typing import Iterable
 
 import cv2
 import numpy as np
-import requests
 
-from .config import OPENROUTER_CHAT_URL, OCR_MODEL, get_openrouter_api_key
 from .verification import call_video_json
-from .video import format_timestamp_precise, materialize_final_matches, materialize_vlm_clip
+from .video import format_timestamp_precise, materialize_final_matches
 
 #JSON format of whole video scan 
 OCR_VIDEO_SCAN_SCHEMA = {
@@ -147,91 +144,18 @@ def _text_similarity(a: str | None, b: str | None) -> float:
         return 1.0 if a_key == b_key else 0.0
     return SequenceMatcher(None, a_key, b_key).ratio()
 
-#Converts OpenCV image into base64 JPEG URL 
-def _image_to_data_url(image: np.ndarray, jpeg_quality: int = 92) -> str:
-    ok, encoded = cv2.imencode(
-        ".jpg",
-        image,
-        [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
-    )
-    if not ok:
-        raise RuntimeError("Could not JPEG-encode frame")
-    payload = base64.b64encode(encoded.tobytes()).decode("ascii")
-    return f"data:image/jpeg;base64,{payload}"
 
-#Parses response returned by OpenRouter 
-def _parse_openrouter_json_content(content):
-    if isinstance(content, str):
-        return json.loads(content)
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                parts.append(part.get("text", ""))
-            elif isinstance(part, str):
-                parts.append(part)
-        if parts:
-            return json.loads("".join(parts))
-    raise RuntimeError(f"Unexpected OpenRouter response content: {content!r}")
-
-#Sends images to OCR model
+#Sends source frames or crops to the local vision model
 def call_images_json(
     images: list[np.ndarray],
     prompt: str,
     schema: dict,
     *,
-    model: str = OCR_MODEL,
-    schema_name: str = "image_ocr_result",
-    timeout: int = 180,
+    role: str = "vision",
 ):
-    """Call an OpenRouter image-capable model with one or more source frames."""
     if not images:
         raise ValueError("At least one image is required")
-
-    if local_backend.active():
-        return local_backend.image_json(images, prompt, schema)
-
-    content = [{"type": "text", "text": prompt}]
-    for image in images:
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": _image_to_data_url(image)},
-            }
-        )
-
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": content}],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_name,
-                "strict": True,
-                "schema": schema,
-            },
-        },
-        "provider": {"require_parameters": True},
-        "temperature": 0,
-    }
-
-    response = requests.post(
-        OPENROUTER_CHAT_URL,
-        headers={
-            "Authorization": f"Bearer {get_openrouter_api_key()}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=timeout,
-    )
-    if not response.ok:
-        raise RuntimeError(
-            f"OpenRouter image OCR call failed: HTTP {response.status_code}\n"
-            f"{response.text}"
-        )
-
-    content = response.json()["choices"][0]["message"]["content"]
-    return _parse_openrouter_json_content(content)
+    return local_backend.images_json(images, prompt, schema, role=role)
 
 #Divides video into overlapping windows for scanning 
 def _scan_windows(duration: float, window: float, overlap: float):
@@ -261,28 +185,13 @@ def scan_ocr_candidates(
     scan_window_seconds: float = 30.0,
     scan_overlap_seconds: float = 2.0,
     min_confidence: float = 0.20,
-    model: str = OCR_MODEL,
-    vlm_cache_dir: str | Path = "ocr_vlm_cache",
 ):
     """Whole-video coarse scan for appearances relevant to a visual visual-text query."""
     duration = float(manifest["video"]["duration"])
     candidates = []
 
-    for window_start, window_end in _scan_windows(
-        duration,
-        scan_window_seconds,
-        scan_overlap_seconds,
-    ):
-        clip_path = materialize_vlm_clip(
-            manifest,
-            window_start,
-            window_end,
-            output_dir=vlm_cache_dir,
-            fps=6,
-            width=960,
-            crf=24,
-            include_audio=False,
-        )
+    windows = list(_scan_windows(duration, scan_window_seconds, scan_overlap_seconds))
+    for window_start, window_end in local_backend.track(windows, "Scanning for visible text"):
         clip_duration = window_end - window_start
 
         prompt = f"""
@@ -323,11 +232,12 @@ Rules:
 """
 
         result = call_video_json(
-            clip_path,
+            manifest,
+            window_start,
+            window_end,
             prompt,
             OCR_VIDEO_SCAN_SCHEMA,
-            model=model,
-            schema_name="generic_visual_ocr_video_scan",
+            include_speech=False,
         )
 
         for item in result.get("items", []):
@@ -521,7 +431,6 @@ def _refine_candidate_frames(
     padding: float,
     max_frames: int,
     image_batch_size: int,
-    model: str,
 ):
     video_path = str(manifest["video"]["path"])
     duration = float(manifest["video"]["duration"])
@@ -597,13 +506,7 @@ For every image where the SAME relevant target is visible:
 
 Return one reading for every input image.
 """
-        result = call_images_json(
-            batch,
-            prompt,
-            OCR_FRAME_REFINE_SCHEMA,
-            model=model,
-            schema_name="generic_visual_ocr_frame_refinement",
-        )
+        result = call_images_json(batch, prompt, OCR_FRAME_REFINE_SCHEMA)
 
         for item in result.get("readings", []):
             local_index = int(item.get("image_index", -1))
@@ -644,7 +547,6 @@ def _read_best_crops(
     target_region: str,
     text_description: str,
     extraction_instruction: str,
-    model: str,
     max_crops: int = 5,
 ):
     if not readings:
@@ -688,13 +590,7 @@ Read only the requested text type independently from each crop. Ignore any unrel
 - confidence is OCR confidence for the visible characters in that crop.
 Return one reading for every input image.
 """
-    result = call_images_json(
-        crops,
-        prompt,
-        OCR_CROP_SCHEMA,
-        model=model,
-        schema_name="generic_visual_ocr_crop_reading",
-    )
+    result = call_images_json(crops, prompt, OCR_CROP_SCHEMA)
 
     output = []
     for item in result.get("readings", []):
@@ -845,7 +741,6 @@ def run_visual_text_extraction(
     max_refine_frames: int = 14,
     image_batch_size: int = 6,
     max_crops_per_appearance: int = 5,
-    model: str = OCR_MODEL,
     output_root: str | Path = "final_results",
     final_frame_fps: float = 4.0,
     max_frames_per_match: int | None = None,
@@ -865,14 +760,13 @@ def run_visual_text_extraction(
         scan_window_seconds=scan_window_seconds,
         scan_overlap_seconds=scan_overlap_seconds,
         min_confidence=min_detection_confidence,
-        model=model,
     )
 
     query_hash = hashlib.sha1(query.encode("utf-8")).hexdigest()[:10]
     evidence_dir = Path(output_root) / query_hash / "visual_text_evidence"
     appearances = []
 
-    for i, candidate in enumerate(candidates):
+    for i, candidate in enumerate(local_backend.track(candidates, "Reading text")):
         
         print(
             f"STARTING {i+1}/{len(candidates)}",
@@ -889,7 +783,6 @@ def run_visual_text_extraction(
             padding=refine_padding_seconds,
             max_frames=max_refine_frames,
             image_batch_size=image_batch_size,
-            model=model,
         )
         crop_readings = _read_best_crops(
             frame_readings,
@@ -898,7 +791,6 @@ def run_visual_text_extraction(
             target_region=target_region,
             text_description=text_description,
             extraction_instruction=extraction_instruction,
-            model=model,
             max_crops=max_crops_per_appearance,
         )
 
@@ -978,6 +870,7 @@ def run_visual_text_extraction(
             )
         ]
 
+    local_backend.stage("Extracting matching clips")
     matches, result_file = materialize_final_matches(
         manifest,
         appearances,

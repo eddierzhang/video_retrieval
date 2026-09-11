@@ -3,15 +3,8 @@ from __future__ import annotations
 
 from . import local_backend
 
-import json
 import re
 from difflib import SequenceMatcher
-
-import requests
-from tqdm import tqdm
-
-from .config import FLASH_VERIFIER_MODEL, OPENROUTER_CHAT_URL, PRO_VERIFIER_MODEL, get_openrouter_api_key
-from .video import materialize_vlm_clip, video_to_data_url
 
 #Takes info from a planned query and converts to input for verification VLM
 def _event_definition_text(plan):
@@ -66,85 +59,26 @@ def _video_windows(start, end, window=75.0, overlap=12.0):
 
     return output
 
-#Parse response 
-def _parse_openrouter_json_content(content):
-    if isinstance(content, str):
-        return json.loads(content)
 
-    # Defensive handling for providers that return content-part arrays.
-    if isinstance(content, list):
-        text_parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text_parts.append(part.get("text", ""))
-            elif isinstance(part, str):
-                text_parts.append(part)
-        if text_parts:
-            return json.loads("".join(text_parts))
-
-    raise RuntimeError(f"Unexpected OpenRouter response content: {content!r}")
-
-#Call an OpenRouter video model and returns a strict JSON-schema response.
+#Ask the local vision model about one interval of the source video; returns schema-validated JSON.
 def call_video_json(
-    video_path,
+    manifest,
+    start,
+    end,
     prompt,
     schema,
-    model,
-    schema_name="video_result",
-    timeout=300,
+    role="vision",
+    include_speech=True,
 ):
-    if local_backend.active():
-        role = "verifier" if model == PRO_VERIFIER_MODEL else "vision"
-        return local_backend.video_json(video_path, prompt, schema, role)
-
-    prompt = (
-        prompt
-        + "\n\nReturn the response as valid JSON only, matching the required schema."
+    return local_backend.interval_json(
+        manifest["video"]["path"],
+        start,
+        end,
+        prompt,
+        schema,
+        role=role,
+        include_speech=include_speech,
     )
-    payload = {
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "video_url",
-                    "video_url": {"url": video_to_data_url(video_path)},
-                },
-            ],
-        }],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_name,
-                "strict": True,
-                "schema": schema,
-            },
-        },
-        "provider": {"require_parameters": True},
-        "temperature": 0,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {get_openrouter_api_key()}",
-        "Content-Type": "application/json",
-    }
-
-    response = requests.post(
-        OPENROUTER_CHAT_URL,
-        headers=headers,
-        json=payload,
-        timeout=timeout,
-    )
-
-    if not response.ok:
-        raise RuntimeError(
-            f"OpenRouter video call failed: HTTP {response.status_code}\n"
-            f"{response.text}"
-        )
-
-    content = response.json()["choices"][0]["message"]["content"]
-    return _parse_openrouter_json_content(content)
 
 #Defines output format for verifier
 MULTI_INSTANCE_SCHEMA = {
@@ -256,11 +190,10 @@ def verify_candidate(
     candidate,
     query,
     plan=None,
-    model=FLASH_VERIFIER_MODEL,
+    role="vision",
     verifier_window_seconds=75.0,
     verifier_overlap_seconds=12.0,
     min_confidence=0.25,
-    vlm_cache_dir="vlm_clip_cache",
 ):
 
     definition_text = _event_definition_text(plan)
@@ -274,12 +207,6 @@ def verify_candidate(
     )
 
     for window_start, window_end in windows:
-        clip_path = materialize_vlm_clip(
-            manifest,
-            window_start,
-            window_end,
-            output_dir=vlm_cache_dir,
-        )
         duration = window_end - window_start
 
         prompt = f"""
@@ -307,11 +234,12 @@ Rules:
 """
 
         result = call_video_json(
-            clip_path,
+            manifest,
+            window_start,
+            window_end,
             prompt,
             MULTI_INSTANCE_SCHEMA,
-            model=model,
-            schema_name="multi_instance_verification",
+            role=role,
         )
 
         for item in result.get("instances", []):
@@ -333,7 +261,7 @@ Rules:
                 "visual_evidence": item.get("visual_evidence", ""),
                 "source_candidate_id": candidate.get("candidate_id"),
                 "retrieval_score": float(candidate.get("score", 0.0)),
-                "verification_model": local_backend.model_label(model),
+                "verification_model": local_backend.model_name(role),
             })
 
     return deduplicate_instances(all_instances, iou_threshold=0.65)
@@ -351,7 +279,7 @@ def verify_candidates_flash(
     selected = candidates if max_candidates is None else candidates[:max_candidates]
     instances = []
 
-    for candidate in tqdm(selected, desc="Flash candidate verification"):
+    for candidate in local_backend.track(selected, "Verifying candidates"):
         found = verify_candidate(
             manifest,
             candidate,
@@ -387,28 +315,21 @@ PRO_VERIFY_SCHEMA = {
     "additionalProperties": False,
 }
 
-#verify one Flash-proposed occurrence with Gemini Pro
+#Stricter second verification of one first-pass occurrence
 def verify_instance_pro(
     manifest,
     instance,
     query,
     plan=None,
-    model=PRO_VERIFIER_MODEL,
+    role="verifier",
     padding=5.0,
     min_confidence=0.50,
-    vlm_cache_dir="vlm_clip_cache",
 ):
 
     video_duration = float(manifest["video"]["duration"])
     clip_start = max(0.0, float(instance["start"]) - padding)
     clip_end = min(video_duration, float(instance["end"]) + padding)
 
-    clip_path = materialize_vlm_clip(
-        manifest,
-        clip_start,
-        clip_end,
-        output_dir=vlm_cache_dir,
-    )
     clip_duration = clip_end - clip_start
     proposed_start = float(instance["start"]) - clip_start
     proposed_end = float(instance["end"]) - clip_start
@@ -434,11 +355,12 @@ If invalid, set start_seconds=-1 and end_seconds=-1.
 """
 
     result = call_video_json(
-        clip_path,
+        manifest,
+        clip_start,
+        clip_end,
         prompt,
         PRO_VERIFY_SCHEMA,
-        model=model,
-        schema_name="strict_instance_verification",
+        role=role,
     )
 
     confidence = float(result.get("confidence", 0.0))
@@ -467,7 +389,7 @@ If invalid, set start_seconds=-1 and end_seconds=-1.
         ),
         "pro_reason": result.get("reason", ""),
         "pro_verified": True,
-        "verification_model": local_backend.model_label(model),
+        "verification_model": local_backend.model_name(role),
     })
     return verified
 
@@ -481,7 +403,7 @@ def verify_instances_pro(
 ):
     verified = []
 
-    for instance in tqdm(instances, desc="Gemini Pro verification"):
+    for instance in local_backend.track(instances, "Confirming matches"):
         result = verify_instance_pro(
             manifest,
             instance,
@@ -543,10 +465,9 @@ def refine_boundary(
     boundary_estimate,
     boundary_type,
     plan=None,
-    model=FLASH_VERIFIER_MODEL,
+    role="vision",
     stages=(8.0, 4.0, 2.0),
     min_confidence=0.45,
-    vlm_cache_dir="vlm_clip_cache",
 ):
     """
     Refine either the START or END boundary using progressively smaller clips.
@@ -571,15 +492,6 @@ def refine_boundary(
         stage_results = []
 
         for probe_start, probe_end in probes:
-            clip_path = materialize_vlm_clip(
-                manifest,
-                probe_start,
-                probe_end,
-                output_dir=vlm_cache_dir,
-                fps=4,
-                width=768,
-                crf=25,
-            )
             duration = probe_end - probe_start
 
             prompt = f"""
@@ -606,11 +518,12 @@ Do not use timestamps from outside this clip.
 """
 
             result = call_video_json(
-                clip_path,
+                manifest,
+                probe_start,
+                probe_end,
                 prompt,
                 BOUNDARY_SCHEMA,
-                model=model,
-                schema_name=f"{boundary_type}_boundary_refinement",
+                role=role,
             )
 
             confidence = float(result.get("confidence", 0.0))
@@ -650,7 +563,7 @@ def refine_instance(
     query,
     plan=None,
     stages=(8.0, 4.0, 2.0),
-    model=FLASH_VERIFIER_MODEL,
+    role="vision",
 ):
     """Refine both boundaries independently for one verified occurrence."""
 
@@ -660,7 +573,7 @@ def refine_instance(
         instance["start"],
         "start",
         plan=plan,
-        model=model,
+        role=role,
         stages=stages,
     )
 
@@ -670,7 +583,7 @@ def refine_instance(
         instance["end"],
         "end",
         plan=plan,
-        model=model,
+        role=role,
         stages=stages,
     )
 
@@ -698,7 +611,7 @@ def refine_instances(
     **kwargs,
 ):
     output = []
-    for instance in tqdm(instances, desc="Boundary refinement"):
+    for instance in local_backend.track(instances, "Refining boundaries"):
         output.append(
             refine_instance(
                 manifest,

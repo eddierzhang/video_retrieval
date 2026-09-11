@@ -1,4 +1,4 @@
-#Breaks a video down into chunks, generates metadata for each chunk, and builds a searchable index of the metadata 
+#Breaks a video down into chunks, generates metadata for each chunk, and builds a searchable index of the metadata
 from __future__ import annotations
 
 from . import local_backend
@@ -8,12 +8,8 @@ import time
 from pathlib import Path
 
 import numpy as np
-import requests
-from tqdm import tqdm
 
-from .config import METADATA_MODEL, OPENROUTER_CHAT_URL, get_openrouter_api_key
 from .embeddings import embed_text, normalize_embedding
-from .video import materialize_metadata_clip, video_to_data_url
 
 #Metadata to include and extract from the video
 VIDEO_METADATA_SCHEMA = {
@@ -207,100 +203,15 @@ Pay particular attention to:
 Make the summary detailed rather than generic.
 """
 
-#Analyze a video clip and return structured metadata
-def analyze_video_clip(
-    video_path,
-    model=METADATA_MODEL,
-    timeout=300,
-):
-
-    if local_backend.active():
-        return local_backend.video_json(video_path, METADATA_PROMPT, VIDEO_METADATA_SCHEMA)
-
-    video_data = video_to_data_url(
-        video_path
+#Analyze one interval of the source video with the local vision model and return structured metadata
+def analyze_video_clip(manifest, start, end):
+    return local_backend.interval_json(
+        manifest["video"]["path"],
+        start,
+        end,
+        METADATA_PROMPT,
+        VIDEO_METADATA_SCHEMA,
     )
-
-    payload = {
-        "model": model,
-
-        "messages": [
-            {
-                "role": "user",
-
-                "content": [
-                    {
-                        "type": "text",
-                        "text": METADATA_PROMPT
-                    },
-
-                    {
-                        "type": "video_url",
-
-                        "video_url": {
-                            "url": video_data
-                        }
-                    }
-                ]
-            }
-        ],
-
-        "response_format": {
-            "type": "json_schema",
-
-            "json_schema": {
-                "name": "video_metadata",
-                "strict": True,
-                "schema": VIDEO_METADATA_SCHEMA
-            }
-        },
-        "provider": {
-            "require_parameters": True
-        },
-
-        "temperature": 0.0
-    }
-
-    headers = {
-        "Authorization":
-            f"Bearer {get_openrouter_api_key()}",
-
-        "Content-Type":
-            "application/json",
-    }
-
-    response = requests.post(
-        OPENROUTER_CHAT_URL,
-        headers=headers,
-        json=payload,
-        timeout=timeout,
-    )
-
-    if not response.ok:
-        raise RuntimeError(
-            "Metadata generation failed:\n"
-            f"HTTP {response.status_code}\n"
-            f"{response.text}"
-        )
-
-    result = response.json()
-
-    content = (
-        result["choices"][0]
-        ["message"]
-        ["content"]
-    )
-
-    # Normal OpenRouter response is a JSON string
-    if isinstance(content, str):
-        metadata = json.loads(content)
-
-    else:
-        raise RuntimeError(
-            f"Unexpected response format: {content}"
-        )
-
-    return metadata
 
 def add_chunk_context(
     metadata,
@@ -328,122 +239,61 @@ def add_chunk_context(
 
     return metadata
 
-#Generates metadata for all chunks in a manifest and saves to a JSONL file
+#Generates metadata for all chunks in a manifest and saves to a JSONL file. Returns the chunks that failed.
 def generate_metadata(
     manifest,
     scale="medium",
     output_path="metadata/medium_metadata.jsonl",
-    video_cache="metadata_video_cache",
     retry_count=3,
-    sleep_seconds=0.25,
     max_chunks=None,
 ):
 
     output_path = Path(output_path)
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     chunks = manifest["chunks"][scale]
-
     if max_chunks is not None:
         chunks = chunks[:max_chunks]
-        
+
+    # Completed chunks are skipped, so an interrupted run resumes where it stopped.
     completed = set()
-
     if output_path.exists():
-
-        with open(
-            output_path,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
+        with open(output_path, "r", encoding="utf-8") as f:
             for line in f:
-
                 try:
-                    row = json.loads(line)
-
-                    completed.add(
-                        row["chunk_id"]
-                    )
-
+                    completed.add(json.loads(line)["chunk_id"])
                 except Exception:
                     pass
 
-    print(
-        f"{len(completed)} chunks already completed."
-    )
-    
-    for chunk in tqdm(
-        chunks,
-        desc=f"Generating {scale} metadata"
-    ):
+    print(f"{len(completed)} chunks already completed.")
 
+    failures = []
+    for chunk in local_backend.track(chunks, f"Describing {scale} scenes"):
         if chunk["chunk_id"] in completed:
             continue
 
-        video_path = materialize_metadata_clip(
-            manifest=manifest,
-            chunk=chunk,
-            output_dir=video_cache,
-        )
-
-        success = False
-
+        error = None
         for attempt in range(retry_count):
-
             try:
-
-                metadata = analyze_video_clip(
-                    video_path
-                )
-
                 metadata = add_chunk_context(
-                    metadata,
-                    chunk
+                    analyze_video_clip(manifest, chunk["start"], chunk["end"]),
+                    chunk,
                 )
-
-                success = True
                 break
-
             except Exception as e:
-
-                print(
-                    f"\n{chunk['chunk_id']} "
-                    f"attempt {attempt + 1} failed:\n"
-                    f"{e}"
-                )
-
+                error = e
+                print(f"\n{chunk['chunk_id']} attempt {attempt + 1} failed:\n{e}")
                 if attempt < retry_count - 1:
-                    time.sleep(
-                        2 ** attempt
-                    )
-
-        if not success:
-            print(
-                "Skipping",
-                chunk["chunk_id"]
-            )
-
+                    time.sleep(2 ** attempt)
+        else:
+            print("Skipping", chunk["chunk_id"])
+            failures.append({"chunk_id": chunk["chunk_id"], "error": str(error)})
             continue
 
-        with open(
-            output_path,
-            "a",
-            encoding="utf-8"
-        ) as f:
+        with open(output_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(metadata) + "\n")
 
-            f.write(
-                json.dumps(metadata)
-                + "\n"
-            )
-
-        time.sleep(
-            sleep_seconds
-        )
+    return failures
 
 def load_jsonl(path):
 
@@ -529,7 +379,7 @@ def embed_metadata_records(
     embeddings = []
     index_metadata = []
 
-    for record in tqdm(records, desc="Embedding metadata"):
+    for record in local_backend.track(records, "Indexing scene descriptions"):
         text = metadata_to_search_text(record)
         success = False
         for attempt in range(retry_count):
