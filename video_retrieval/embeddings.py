@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from . import local_backend
+
 import json
 import time
 from pathlib import Path
@@ -19,6 +21,8 @@ from .video import materialize_embedding_clip, video_to_data_url
 
 #Embed text with the configured multimodal embedding model through OpenRouter.
 def embed_text(text, input_type=None):
+    if local_backend.active():
+        return local_backend.embed_text(text)
     payload = {
         "model": EMBEDDING_MODEL,
         "input": text,
@@ -50,6 +54,8 @@ def embed_text(text, input_type=None):
 
 #Embed one reconstructed video chunk with the same multimodal model as text.
 def embed_video(video_path):
+    if local_backend.active():
+        return local_backend.embed_video(video_path)
     video_path = Path(video_path)
     raw_size_mb = video_path.stat().st_size / (1024 ** 2)
 

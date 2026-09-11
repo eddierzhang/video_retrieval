@@ -29,6 +29,7 @@ class RetrievalResources:
     transcript_index: Any = None
     transcript_bm25: Any = None
     transcript_metadata: list[dict] | None = None
+    local_models: Any = None
 
 #Wrapper Class
 class VideoRetrievalPipeline:
@@ -36,6 +37,12 @@ class VideoRetrievalPipeline:
         self.resources = resources
 
     def retrieve(self, query: str, **kwargs):
+        if self.resources.local_models is not None:
+            from .local_backend import use_local
+            with use_local(self.resources.local_models):
+                result = retrieve_video(query=query, resources=self.resources, **kwargs)
+                result['model_backend'] = self.resources.local_models.signature()
+                return result
         return retrieve_video(query=query, resources=self.resources, **kwargs)
 
 #Method to retrieve the actual video. Each final match contains precise timestamps, a matching clip, and matching frame paths extracted from the original source video.

@@ -1,6 +1,8 @@
 #Handles visual text/OCR retrieval pipeline by scanning video for text-bearing targets
 from __future__ import annotations
 
+from . import local_backend
+
 import base64
 import hashlib
 import json
@@ -185,6 +187,9 @@ def call_images_json(
     """Call an OpenRouter image-capable model with one or more source frames."""
     if not images:
         raise ValueError("At least one image is required")
+
+    if local_backend.active():
+        return local_backend.image_json(images, prompt, schema)
 
     content = [{"type": "text", "text": prompt}]
     for image in images:

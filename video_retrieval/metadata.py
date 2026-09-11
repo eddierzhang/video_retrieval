@@ -1,6 +1,8 @@
 #Breaks a video down into chunks, generates metadata for each chunk, and builds a searchable index of the metadata 
 from __future__ import annotations
 
+from . import local_backend
+
 import json
 import time
 from pathlib import Path
@@ -211,6 +213,9 @@ def analyze_video_clip(
     model=METADATA_MODEL,
     timeout=300,
 ):
+
+    if local_backend.active():
+        return local_backend.video_json(video_path, METADATA_PROMPT, VIDEO_METADATA_SCHEMA)
 
     video_data = video_to_data_url(
         video_path

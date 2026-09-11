@@ -1,6 +1,8 @@
 #Audio transcription plus semantic and BM25 transcript retrieval
 from __future__ import annotations
 
+from . import local_backend
+
 import base64
 import json
 import re
@@ -141,6 +143,9 @@ def transcribe_audio_chunk(
     language=None,
     word_timestamps=True,
 ):
+    if local_backend.active():
+        return local_backend.transcribe(audio_path, language, word_timestamps)
+
     encoded_audio = audio_to_base64(
         audio_path
     )

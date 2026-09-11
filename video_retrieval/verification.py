@@ -1,6 +1,8 @@
 #VLM Verification of candidate frames after retrieval
 from __future__ import annotations
 
+from . import local_backend
+
 import json
 import re
 from difflib import SequenceMatcher
@@ -91,6 +93,10 @@ def call_video_json(
     schema_name="video_result",
     timeout=300,
 ):
+    if local_backend.active():
+        role = "verifier" if model == PRO_VERIFIER_MODEL else "vision"
+        return local_backend.video_json(video_path, prompt, schema, role)
+
     prompt = (
         prompt
         + "\n\nReturn the response as valid JSON only, matching the required schema."
@@ -327,7 +333,7 @@ Rules:
                 "visual_evidence": item.get("visual_evidence", ""),
                 "source_candidate_id": candidate.get("candidate_id"),
                 "retrieval_score": float(candidate.get("score", 0.0)),
-                "verification_model": model,
+                "verification_model": local_backend.model_label(model),
             })
 
     return deduplicate_instances(all_instances, iou_threshold=0.65)
@@ -461,7 +467,7 @@ If invalid, set start_seconds=-1 and end_seconds=-1.
         ),
         "pro_reason": result.get("reason", ""),
         "pro_verified": True,
-        "verification_model": model,
+        "verification_model": local_backend.model_label(model),
     })
     return verified
 

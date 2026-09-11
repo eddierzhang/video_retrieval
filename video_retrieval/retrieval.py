@@ -1,6 +1,8 @@
 #Query planning, multimodal retrieval, fusion, and initial candidate clustering.
 from __future__ import annotations
 
+from . import local_backend
+
 import json
 import math
 
@@ -118,7 +120,7 @@ General planning rules:
 - Define what counts and does not count as a valid result.
 - Keep routing_reason short (one sentence); it is diagnostic, not chain-of-thought.
 """
-    #Defines what the planner must return 
+    #Defines what the planner must return
     schema = {
         "type": "object",
         "properties": {
@@ -288,27 +290,30 @@ General planning rules:
         "temperature": 0,
     }
 
-    headers = {
-        "Authorization": f"Bearer {get_openrouter_api_key()}",
-        "Content-Type": "application/json",
-    }
+    if local_backend.active():
+        plan = local_backend.chat_json(prompt, schema, role="planner")
+    else:
+        headers = {
+            "Authorization": f"Bearer {get_openrouter_api_key()}",
+            "Content-Type": "application/json",
+        }
 
-    #Call the planner
-    response = requests.post(
-        OPENROUTER_CHAT_URL,
-        headers=headers,
-        json=payload,
-        timeout=120,
-    )
-
-    if not response.ok:
-        raise RuntimeError(
-            f"Query planning failed: HTTP {response.status_code}\n"
-            f"{response.text}"
+        #Call the planner
+        response = requests.post(
+            OPENROUTER_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=120,
         )
 
-    content = response.json()["choices"][0]["message"]["content"]
-    plan = json.loads(content)
+        if not response.ok:
+            raise RuntimeError(
+                f"Query planning failed: HTTP {response.status_code}\n"
+                f"{response.text}"
+            )
+
+        content = response.json()["choices"][0]["message"]["content"]
+        plan = json.loads(content)
 
     #Type of query
     if plan.get("executor") == "visual_text_extraction":
@@ -349,7 +354,7 @@ General planning rules:
             "transcript_semantic",
             "transcript_bm25",
         }
-        
+
         #Cleans output
         cleaned_predicates = []
         seen_predicates = set()
@@ -395,7 +400,7 @@ General planning rules:
             for key, value in plan["weights"].items()
         }
         total = sum(weights.values())
-        
+
         #Normalize retrieval weights
         if total <= 0:
             weights = {
@@ -480,7 +485,7 @@ def _annotate_ranking(ranking, spec, channel):
         annotated.append(row)
     return annotated
 
-#Execute both full-query searches and atomic evidence-predicate searches. Outputs retrieval results for each search channel 
+#Execute both full-query searches and atomic evidence-predicate searches. Outputs retrieval results for each search channel
 def run_retrieval_plan(
     plan,
     video_index,
@@ -557,7 +562,7 @@ def timestamp_bin(seconds, bin_size=5):
         seconds // bin_size
     )
 
-#Flattens rankings 
+#Flattens rankings
 def flatten_rankings(
     rankings
 ):
@@ -694,7 +699,7 @@ def fuse_retrieval_results(
 
     return ranked
 
-#Converts and normalizes all ranking scores to between 0 and 1 
+#Converts and normalizes all ranking scores to between 0 and 1
 def _calibrate_ranking_scores(ranking):
     """Map one retrieval ranking to stable 0..1 scores without mixing raw modalities."""
     if not ranking:
@@ -937,7 +942,7 @@ def candidates_from_evidence_map(
 
     return regions
 
-#Score of an arbitrary window based on the scores inside the window 
+#Score of an arbitrary window based on the scores inside the window
 def _window_evidence_score(evidence_map, start, end):
     rows = [
         row for row in evidence_map
