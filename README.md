@@ -195,3 +195,39 @@ New queries can be entered by modifying the PROMPT variable.
 2. **Add stronger temporal reasoning:** Extend the query planner to understand relationships such as before, after, during, and then by analyzing more video chunks, allowing the system to handle queries involving sequences of multiple events.
 3. **Improve ranking and score calibration:** Tune or learn how much weight to give video, transcript, metadata, OCR, and BM25 evidence for each query instead of relying mainly on manually selected scoring rules.
 4. **Build an annotated formal evaluation benchmark:** Create a labeled benchmark with ground-truth timestamps and query-event pairs to systematically evaluate retrieval accuracy, temporal localization, and overall system performance.
+
+## Local video-search UI
+
+The Streamlit prototype searches videos already indexed by `model_completed.ipynb`.
+It includes video selection, source playback, search settings, matching clips,
+confidence scores, query diagnostics, and downloadable JSON results.
+
+From the repository root in PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-ui.txt
+$env:OPENROUTER_API_KEY = "your-key-here"
+.\.venv\Scripts\python.exe -m streamlit run app.py --server.address 127.0.0.1
+```
+
+Open the localhost URL printed by Streamlit. Keep this prototype local; it has no
+user authentication. Searches use the existing OpenRouter pipeline and incur its
+normal API usage. The key stays in the server environment, not in the UI or files.
+FFmpeg must be on PATH for verification and clip extraction.
+
+1. Select an indexed video from the sidebar. The app discovers `*chunks/manifest.json`
+   under the repository root, or accepts a custom manifest path.
+2. If the video moved, update **Source video path** to the same original video.
+3. Check **Index locations**: visual, metadata, and transcript indexes must all
+   belong to that video. Defaults follow the notebook's `video_16_*` naming pattern.
+4. Enter a query and click **Search video**. A status panel remains visible while
+   the existing pipeline runs; detailed pipeline logs remain in the terminal.
+5. Play matching clips or download the results JSON. OCR fields appear in match details.
+
+Indexes load once per browser session and configuration. Use **Reload indexes**
+if their contents change. Each search writes to its own `final_results/ui/` folder.
+The app does not upload or index new videos: prepare those in the notebook first.
+Generated data and secrets are ignored for new Git additions; previously tracked
+bytecode remains tracked and should not be included in source commits.
+
+UI API reference: [Streamlit documentation](https://docs.streamlit.io/develop/api-reference).
