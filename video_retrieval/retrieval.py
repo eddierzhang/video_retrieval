@@ -291,7 +291,7 @@ General planning rules:
     }
 
     if local_backend.active():
-        plan = local_backend.chat_json(prompt, schema, role="planner")
+        plan = local_backend.chat_json(prompt + "\nPlan only this user request: " + query, schema, role="planner")
     else:
         headers = {
             "Authorization": f"Bearer {get_openrouter_api_key()}",

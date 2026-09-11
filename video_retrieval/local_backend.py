@@ -15,13 +15,13 @@ import requests
 
 @dataclass(frozen=True)
 class LocalModels:
-    planner: str = 'qwen2.5vl:3b'
+    planner: str = 'qwen2.5:7b'
     vision: str = 'qwen2.5vl:3b'
     verifier: str = 'qwen2.5vl:3b'
     frame_limit: int = 12
 
     def signature(self):
-        return {'version': 1, 'embedding': 'clip-vit-base-patch32-mean-v1',
+        return {'version': 2, 'embedding': 'clip-vit-base-patch32-mean-v1',
                 'transcription': 'faster-whisper-base', **asdict(self)}
 
 
@@ -68,24 +68,32 @@ def check_runtime(models):
     missing = {models.planner, models.vision, models.verifier} - available
     if missing:
         raise RuntimeError('Download missing Ollama models: ' + ', '.join(sorted(missing)))
+    return {row['name']: row.get('digest', '') for row in response.json().get('models', [])
+            if row['name'] in {models.planner, models.vision, models.verifier}}
 
 
 def chat_json(prompt, schema, images=None, role='vision'):
     models = _models.get() or LocalModels()
     name = getattr(models, role)
     notify(f'Local {role}: {name}')
-    message = {'role': 'user', 'content': prompt + '\nReturn only JSON matching this schema:\n' + json.dumps(schema)}
+    message = {'role': 'user', 'content': prompt + '\nReturn only compact JSON matching this schema. Do not add whitespace padding or commentary:\n' + json.dumps(schema)}
     if images:
         message['images'] = images
-    response = requests.post(URL + '/api/chat', json={
-        'model': name, 'messages': [message], 'format': schema, 'stream': False,
-        'options': {'temperature': 0, 'num_ctx': 16384, 'num_predict': 4096},
-        'keep_alive': '30m',
-    }, timeout=1800)
-    response.raise_for_status()
-    result = json.loads(response.json()['message']['content'])
-    jsonschema.validate(result, schema)
-    return result
+    for attempt in range(2):
+        response = requests.post(URL + '/api/chat', json={
+            'model': name, 'messages': [message], 'format': schema, 'stream': False,
+            'options': {'temperature': 0, 'num_ctx': 32768, 'num_predict': 4096},
+            'keep_alive': '30m',
+        }, timeout=1800)
+        response.raise_for_status()
+        try:
+            result = json.loads(response.json()['message']['content'])
+            jsonschema.validate(result, schema)
+            return result
+        except (ValueError, jsonschema.ValidationError) as exc:
+            if attempt:
+                raise RuntimeError(f'Local {role} model returned invalid or incomplete JSON. Try a stronger local model or fewer frames.') from exc
+            message['content'] += '\nYour last attempt was invalid. Return one complete, concise JSON object, with short arrays and no padding.'
 
 
 def sampled_frames(path, limit):

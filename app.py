@@ -14,7 +14,11 @@ st.set_page_config(page_title='Video Search', page_icon='🎬', layout='wide')
 st.title('Video Search')
 st.caption('Find moments in your indexed videos using natural language.')
 
-mode = st.sidebar.radio('Processing mode', ['Local uploads (no key)', 'OpenRouter indexes'])
+mode = st.sidebar.radio('Processing mode', ['Original architecture (local)', 'Local uploads (no key)', 'OpenRouter indexes'])
+if mode == 'Original architecture (local)':
+    from architecture_ui import render
+    render()
+    st.stop()
 if mode == 'Local uploads (no key)':
     from local_ui import render
     render()

@@ -39,6 +39,10 @@ def generate_windows(
     stride,
     min_final_fraction=0.25,
 ):
+    if not all(math.isfinite(float(value)) for value in (video_duration, window_size, stride)):
+        raise ValueError('Window parameters must be finite.')
+    if video_duration <= 0 or window_size <= 0 or stride <= 0:
+        raise ValueError('Duration, window size, and stride must be positive.')
     windows = []
     start = 0.0
 
@@ -47,7 +51,7 @@ def generate_windows(
         duration = end - start
 
         # Skip a tiny leftover window at the end
-        if duration < window_size * min_final_fraction:
+        if windows and duration < window_size * min_final_fraction:
             break
 
         windows.append(

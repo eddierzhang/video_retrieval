@@ -1,3 +1,7 @@
+> **Current UI default: Original architecture (local).** Uploads now use the
+> original hierarchical and multimodal pipeline with local model adapters.
+> See "Original architecture with local models" below for setup.
+
 # Overview 
 This repository implements a zero-shot video retrieval pipeline that takes in a natural language query and returns the most relevant timestamped clips from a video. The main goal is to retrieve events that may depend on several types of information including: 
 - Visual appearance and actions
@@ -235,7 +239,7 @@ UI API reference: [Streamlit documentation](https://docs.streamlit.io/develop/ap
 
 ## Upload videos without an API key
 
-The app now defaults to **Local uploads (no key)**. Install the local dependencies:
+The earlier simplified mode is available as **Local uploads (no key)**. Install the local dependencies:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-local.txt
@@ -271,3 +275,75 @@ original dependencies and an API key. Run regression tests with
 
 Model references: [CLIP](https://huggingface.co/openai/clip-vit-base-patch32),
 [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
+
+
+## Original architecture with local models
+
+This is now the default UI mode. It preserves the original hierarchy, query planner,
+visual/metadata/transcript retrieval, semantic plus BM25 search, evidence fusion,
+recursive candidate refinement, first and second verification passes, boundary
+refinement, temporal NMS, OCR route, and final clip/frame extraction.
+
+Only model calls change:
+
+| Existing role | Local replacement |
+| --- | --- |
+| Gemini multimodal embeddings | CLIP image/text embeddings, with normalized mean pooling over frames/text segments |
+| Whisper through OpenRouter | faster-whisper base, with word timestamps |
+| Query planner | Qwen2.5 7B through local Ollama |
+| Scene metadata, first verification, boundary refinement, OCR | Qwen2.5-VL 3B through local Ollama |
+| Second verification | A separate original verification pass using Qwen2.5-VL 3B by default; configurable model |
+
+The VLM receives timestamped sampled frames and locally transcribed speech, not a
+native video stream. Sparse frames and smaller local models can reduce action,
+OCR, temporal precision, and reasoning accuracy relative to the hosted models.
+The two verification stages remain separate but share the same default model.
+No accuracy equivalence is claimed. Increasing the frame limit trades speed and
+memory for coverage. CPU CLIP/Whisper and GPU Ollama can coexist.
+
+### Start on this machine
+
+The project-local Ollama runtime and model are stored in ignored `local_data/`.
+In one PowerShell terminal, start the model server:
+
+```powershell
+.\start-local.ps1
+```
+
+In another terminal:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-local.txt
+.\.venv\Scripts\python.exe -m streamlit run app.py --server.address 127.0.0.1
+```
+
+Open the displayed localhost URL, select **Original architecture (local)**,
+upload a video, and click **Process with original architecture**. When ready,
+enter a query and click **Search with original pipeline**. The status panel reports
+the active model stage; detailed per-chunk progress appears in the terminal.
+If a local Ollama server is already running, reuse it instead of starting another.
+
+### Setup on another machine
+
+Install [Ollama](https://ollama.com/download/windows), run `start-local.ps1`, then
+run `ollama pull qwen2.5vl:3b` and `ollama pull qwen2.5:7b` in another terminal. The portable runtime may also
+be placed at `local_data/ollama_runtime/ollama.exe`. Install the Python dependencies
+above and ensure FFmpeg/ffprobe are on PATH. Initial downloads need internet but
+inference has no API key and sends requests only to the local Ollama service.
+See [Ollama Windows setup](https://docs.ollama.com/windows) and
+[structured outputs](https://docs.ollama.com/capabilities/structured-outputs).
+
+Uploads live under `local_data/<content hash>/`. Original-architecture indexes live
+under `architecture/<configuration hash>/` within that upload folder. The cache key
+includes local model identities/digests, source file identity, and sampling settings.
+Gemini indexes and the earlier simple frame-search index are not loaded into this
+pipeline. Reprocessing an identical upload reuses complete matching local indexes.
+Failed/incomplete indexing is not marked ready; retry to resume saved metadata and
+transcription work. Videos with no audio or no detected speech keep visual and
+metadata retrieval and have no transcript channel.
+
+`VideoRetrievalPipeline` automatically activates local adapters when its resources
+contain `local_models`. For lower-level calls use `with use_local(LocalModels()):`.
+The local context is scoped to the operation, so another browser session using the
+legacy hosted mode cannot switch this session's backend. Invalid model JSON fails
+schema validation rather than being silently accepted as a verification result.

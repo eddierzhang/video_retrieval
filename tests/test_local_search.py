@@ -67,6 +67,7 @@ class LocalSearchTest(unittest.TestCase):
 
     def test_local_ui_default_and_results(self):
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'app.py')).run()
+        app.radio[0].set_value('Local uploads (no key)').run()
         self.assertFalse(app.exception)
         self.assertEqual(app.radio[0].value, 'Local uploads (no key)')
         app.session_state['local_video'] = {

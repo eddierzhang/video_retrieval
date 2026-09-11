@@ -15,6 +15,13 @@ from video_retrieval.pipeline import RetrievalResources, VideoRetrievalPipeline
 
 
 class LocalArchitectureTest(unittest.TestCase):
+    def test_short_upload_keeps_each_hierarchy_scale(self):
+        from video_retrieval.video import generate_windows
+        self.assertEqual(generate_windows(12, 120, 60), [(0.0, 12)])
+        self.assertEqual(generate_windows(1, 8, 4), [(0.0, 1)])
+        with self.assertRaises(ValueError):
+            generate_windows(12, 8, 0)
+
     def test_all_model_boundaries_route_locally(self):
         with patch('requests.post', side_effect=AssertionError('Hosted request attempted')), local.use_local():
             with patch.object(local, 'embed_text', return_value=np.ones(512)) as text:
