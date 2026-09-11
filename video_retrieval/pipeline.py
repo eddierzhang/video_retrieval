@@ -59,7 +59,7 @@ def retrieve_video(
     recursive_min_window_seconds=12.0,
     recursive_context_padding=4.0,
     flash_min_confidence=0.10,
-    pro_min_confidence=0.40,
+    pro_min_confidence=0.25,
     run_pro_verification=True,
     refine_boundaries=True,
     refinement_stages=(8.0, 4.0, 2.0),

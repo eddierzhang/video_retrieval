@@ -734,7 +734,7 @@ def _calibrate_ranking_scores(ranking):
 
     return output
 
-#Smooth evidence scores between nieghboring time bins
+#Smooth evidence scores between neighboring time bins
 def _smooth_series(values, radius=1):
     if radius <= 0 or len(values) <= 1:
         return list(values)
