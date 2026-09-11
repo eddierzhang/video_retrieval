@@ -35,6 +35,7 @@ class SearchUITest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.app = AppTest.from_file(str(ROOT / 'app.py')).run()
+        self.app.radio[0].set_value('OpenRouter indexes').run()
 
     def search(self, query='person'):
         next(x for x in self.app.text_input if x.label == 'What are you looking for?').set_value(query)

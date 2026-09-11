@@ -231,3 +231,43 @@ Generated data and secrets are ignored for new Git additions; previously tracked
 bytecode remains tracked and should not be included in source commits.
 
 UI API reference: [Streamlit documentation](https://docs.streamlit.io/develop/api-reference).
+
+
+## Upload videos without an API key
+
+The app now defaults to **Local uploads (no key)**. Install the local dependencies:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-local.txt
+.\.venv\Scripts\python.exe -m streamlit run app.py --server.address 127.0.0.1
+```
+
+Upload a video, choose the frame sampling interval, optionally enable speech
+transcription, and click **Process uploaded video**. Once processing finishes,
+enter a visual description or search for words from the transcript. Results play
+from the matching timestamps and can be exported as JSON. The currently processed
+video is named above the search form; selecting another upload does not replace it
+until you click Process again.
+
+- Visual retrieval uses local CLIP (`openai/clip-vit-base-patch32`) on sampled frames.
+- Optional speech transcription uses faster-whisper's multilingual `base` model on
+  CPU with int8 computation. Speech search matches words, not semantic paraphrases.
+- No API key or hosted inference is used. First use requires internet to download
+  model weights; subsequent use can reuse the local cache. Videos stay on this machine.
+- Models, uploaded videos, and indexes are stored under ignored `local_data/`.
+  Reprocessing identical content with identical sampling settings reuses the visual
+  index. Reuploading after an app restart lets you reuse the saved processing.
+- Default upload limit is Streamlit's 200 MB; to increase it, append
+  `--server.maxUploadSize 1024` to the launch command. Videos are limited to two hours.
+- CPU processing can take time. Sparse frame sampling can miss brief actions;
+  visual scores are rankings, not calibrated confidence, and even unrelated queries
+  return nearest frames. This mode does not run Gemini verification, OCR, or complex
+  temporal reasoning. Video playback depends on browser codec support (H.264 MP4 is
+  the most portable choice).
+
+The original interface remains under **OpenRouter indexes** and still needs the
+original dependencies and an API key. Run regression tests with
+`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`.
+
+Model references: [CLIP](https://huggingface.co/openai/clip-vit-base-patch32),
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper).
