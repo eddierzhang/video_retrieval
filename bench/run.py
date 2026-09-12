@@ -17,6 +17,7 @@ import argparse
 from datetime import datetime
 import json
 from pathlib import Path
+import random
 import re
 import statistics
 import tempfile
@@ -159,6 +160,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dataset", default=str(DATASET))
     parser.add_argument("--only", action="append", help="row id; repeatable")
+    parser.add_argument("--sample", type=int, help="run a random but repeatable subset of this size")
+    parser.add_argument("--video", action="append", help="restrict to these library videos")
     parser.add_argument("--mode", choices=("verified", "quick"), help="override the mode of every row")
     parser.add_argument("--out", help="where to write the result JSON")
     parser.add_argument("--compare", help="an earlier result file to diff against")
@@ -166,8 +169,12 @@ def main():
 
     dataset = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
     rows = [row for row in dataset["rows"] if not args.only or row["id"] in args.only]
+    if args.video:
+        rows = [row for row in rows if row["video"] in set(args.video)]
     if not rows:
         raise SystemExit("No rows selected.")
+    if args.sample and args.sample < len(rows):
+        rows = random.Random(0).sample(rows, args.sample)
     if args.mode:
         rows = [{**row, "mode": args.mode} for row in rows]
 
@@ -181,6 +188,7 @@ def main():
 
     result = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "dataset": str(args.dataset),
         "models": models.signature(),
         "summary": summarize(measured),
         "rows": measured,

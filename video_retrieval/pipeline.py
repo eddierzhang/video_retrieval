@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from . import local_backend
+from . import learning, local_backend
 from .local_backend import LocalModels, use_models
 from .retrieval import (
     apply_temporal_ordering,
@@ -242,6 +242,14 @@ def retrieve_video(
     }
 
     if run_verification:
+        # A trained pre-filter, when one exists, drops candidates the vision model
+        # would reject. Until then this returns the candidates untouched.
+        candidates, prefilter = learning.prefilter_candidates(
+            candidates, evidence_map, plan, manifest["video"]["duration"]
+        )
+        if prefilter:
+            diagnostics["prefilter"] = prefilter
+
         # 6. First vision-model pass finds every occurrence inside each candidate
         local_backend.stage("Verifying candidates with the vision model")
         instances = verify_candidates_flash(
@@ -323,6 +331,13 @@ def retrieve_video(
         frame_fps=final_frame_fps,
         max_frames_per_match=max_frames_per_match,
     )
+
+    if run_verification:
+        # The vision model's own verdicts are the training signal for the pre-filter.
+        learning.log_candidates(
+            candidates, evidence_map, plan, manifest["video"]["duration"], query,
+            [match.get("source_candidate_id") for match in matches],
+        )
 
     result = {
         "query": query,

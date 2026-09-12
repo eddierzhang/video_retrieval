@@ -177,6 +177,128 @@ class LocalArchitectureTest(unittest.TestCase):
             plan = plan_query("something happens and then something else")
         self.assertEqual([(rule["first"], rule["then"]) for rule in plan["ordering"]], [("a", "b")])
 
+    def test_prefilter_is_inert_until_a_model_is_trained(self):
+        from video_retrieval import learning
+
+        candidates = [{"candidate_id": i, "start": i * 10, "end": i * 10 + 8, "score": 1.0 - i * 0.1} for i in range(8)]
+        with patch.object(learning, "load_prefilter", return_value=None):
+            kept, info = learning.prefilter_candidates(candidates, [], {}, 100)
+        self.assertIs(kept, candidates)
+        self.assertIsNone(info)
+
+    def test_prefilter_drops_weak_candidates_but_keeps_a_floor(self):
+        from video_retrieval import learning
+
+        candidates = [{"candidate_id": i, "start": i * 10, "end": i * 10 + 8, "score": 1.0 - i * 0.1} for i in range(8)]
+        weights = [0.0] * len(learning.FEATURE_NAMES)
+        weights[learning.FEATURE_NAMES.index("score")] = 10.0
+        model = {"mean": [0.0] * len(weights), "std": [1.0] * len(weights),
+                 "weights": weights, "bias": 0.0, "threshold": 0.999}
+        with patch.object(learning, "load_prefilter", return_value=model):
+            kept, info = learning.prefilter_candidates(candidates, [], {}, 100, keep_min=3)
+        self.assertEqual(info["before"], 8)
+        self.assertLess(len(kept), 8)
+        self.assertGreaterEqual(len(kept), 3)
+        self.assertEqual(kept[0]["candidate_id"], 0)
+
+    def test_query_adapter_applies_only_when_trained(self):
+        from video_retrieval import learning
+
+        weights = np.zeros((4, 4), dtype=np.float32)
+        weights[0, 1] = 1.0
+        query = np.array([1, 0, 0, 0], dtype=np.float32)
+        with patch.object(learning, "load_adapter", return_value=weights):
+            np.testing.assert_allclose(learning.apply_query_adapter(query), [0, 1, 0, 0], atol=1e-6)
+        with patch.object(learning, "load_adapter", return_value=None):
+            np.testing.assert_allclose(learning.apply_query_adapter(query), [1, 0, 0, 0])
+
+    def test_candidate_features_describe_the_window(self):
+        from video_retrieval import learning
+
+        evidence = [{"start": t, "end": t + 2, "score": 0.5, "channel_scores": {
+            "video": 0.8 if 10 <= t < 18 else 0.1, "metadata": 0.2,
+            "transcript_semantic": 0.0, "transcript_bm25": 0.0,
+            "negative": 0.3 if t >= 30 else 0.0}} for t in range(0, 40, 2)]
+        candidates = [{"candidate_id": 0, "start": 10, "end": 18, "score": 0.9, "evidence_mass": 3.0},
+                      {"candidate_id": 1, "start": 30, "end": 38, "score": 0.3}]
+        features = learning.candidate_features(candidates[0], 0, candidates, evidence,
+                                               {"expected_duration": {"max_seconds": 8}}, 40)
+        self.assertAlmostEqual(features["channel_video"], 0.8)
+        self.assertAlmostEqual(features["channel_negative"], 0.0)
+        self.assertAlmostEqual(features["relative_score"], 1.0)
+        self.assertAlmostEqual(features["duration_ratio"], 1.0)
+        self.assertAlmostEqual(learning.candidate_features(candidates[1], 1, candidates, evidence, {}, 40)["channel_negative"], 0.3)
+        self.assertEqual(len(learning.vectorize(features)), len(learning.FEATURE_NAMES))
+
+    def test_adapter_split_keeps_every_text_of_a_span_together(self):
+        from bench.adapt import split_groups
+
+        groups = [{"video": f"v{index // 5}", "start": index * 10, "end": index * 10 + 8} for index in range(20)]
+        train, holdout = split_groups(groups, holdout=0.25)
+        self.assertEqual(len(train), len(groups))
+        self.assertTrue((train ^ holdout).all())  # a span is on exactly one side
+        self.assertGreaterEqual(holdout.sum(), 1)
+        by_video = split_groups(groups, holdout=0.25, by="video")[1]
+        held = {group["video"] for group, keep in zip(groups, by_video) if keep}
+        self.assertTrue(all(by_video[index] == (groups[index]["video"] in held) for index in range(len(groups))))
+
+    def test_adapter_masks_overlapping_spans_and_repeated_wording(self):
+        from bench.adapt import build_mask
+
+        groups = [
+            {"video": "a", "start": 0, "end": 30},    # 0
+            {"video": "a", "start": 15, "end": 45},   # 1 overlaps 0
+            {"video": "a", "start": 60, "end": 90},   # 2 far away, same wording as 0
+            {"video": "b", "start": 0, "end": 30},    # 3 another video
+        ]
+        text_groups = np.array([0, 1, 2, 3])
+        vectors = np.zeros((4, 3), dtype=np.float32)
+        vectors[0] = vectors[2] = [1, 0, 0]  # spans 0 and 2 described identically
+        vectors[1] = [0, 1, 0]
+        vectors[3] = [0, 0, 1]
+        mask = build_mask(groups, text_groups, vectors, mask_iou=0.25)
+        self.assertFalse(mask[np.arange(4), text_groups].any())  # never its own span
+        self.assertTrue(mask[0, 1])   # overlapping in time
+        self.assertTrue(mask[0, 2])   # same wording elsewhere in the video
+        self.assertFalse(mask[1, 2])  # a genuine negative survives
+        self.assertFalse(mask[0, 3])  # another video is never masked
+
+    def test_adapter_evaluation_ranks_within_one_video(self):
+        from bench.adapt import evaluate
+
+        # Six spans in one video; each text matches its own span's second view exactly.
+        groups = []
+        for index in range(6):
+            views = np.zeros((1, 2, 6), dtype=np.float32)
+            views[0, 0] = 0.5
+            views[0, 1, index] = 1.0
+            groups.append({"video": "a", "start": index * 10, "end": index * 10 + 8, "views": views})
+        texts = np.eye(6, dtype=np.float32)
+        text_groups = np.arange(6)
+        mask = np.zeros((6, 6), dtype=bool)
+        perfect = evaluate(texts, text_groups, groups, mask, min_gallery=5)
+        self.assertEqual(perfect["recall@1"], 1.0)
+        self.assertEqual(perfect["texts"], 6)
+        # A gallery smaller than min_gallery says nothing, so it is not scored at all.
+        self.assertEqual(evaluate(texts[:2], text_groups[:2], groups[:2], mask[:2, :2], min_gallery=5)["texts"], 0)
+        # Scoring against the wrong view would lose the signal the tiles carry.
+        flattened = [dict(group, views=group["views"][:, :1]) for group in groups]
+        self.assertLess(evaluate(texts, text_groups, flattened, mask, min_gallery=5)["recall@1"], 1.0)
+
+    def test_verifier_decisions_are_logged_as_training_rows(self):
+        from video_retrieval import learning
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "candidates.jsonl"
+            with patch.object(learning, "CANDIDATE_EXAMPLES", path), patch.object(learning, "LEARNING_DIR", Path(folder)):
+                learning.log_candidates(
+                    [{"candidate_id": 0, "start": 0, "end": 8, "score": 0.9},
+                     {"candidate_id": 1, "start": 20, "end": 28, "score": 0.4}],
+                    [], {}, 40, "a person waves", survivors=[0])
+            rows = learning.load_examples(path)
+        self.assertEqual([row["label"] for row in rows], [1, 0])
+        self.assertEqual(rows[0]["query"], "a person waves")
+
     def test_verification_windows_stay_short_enough_to_see_detail(self):
         import inspect
 

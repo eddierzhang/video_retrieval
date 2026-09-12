@@ -310,7 +310,11 @@ def embed_text(text):
     words = str(text).split()
     pieces = [" ".join(words[i:i + 40]) for i in range(0, len(words), 40)] or [""]
     vector = encode(text=pieces).mean(axis=0)
-    return (vector / max(np.linalg.norm(vector), 1e-8)).astype(np.float32)
+    vector = (vector / max(np.linalg.norm(vector), 1e-8)).astype(np.float32)
+    # A trained adapter maps the query into the space the indexed frames occupy.
+    from .learning import apply_query_adapter
+
+    return apply_query_adapter(vector)
 
 
 # nomic-embed asks for a task prefix; other models take the text unchanged.

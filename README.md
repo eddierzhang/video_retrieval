@@ -194,6 +194,77 @@ is a smoke test, not a benchmark, until you add your own. To label a row: play t
 note when the event really starts and ends, and append an entry. Ten careful rows are worth more
 than fifty careless ones.
 
+### Labels without labeling
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.synthesize
+```
+
+Each indexed chunk already carries a description written by the vision model. Asking the planner to
+turn those into the queries a person might type makes the chunk itself the ground truth: three
+videos here produced 83 pairs in a couple of minutes, written to `bench/synthetic.json`.
+
+These measure whether retrieval can find **what the scene model saw**, not whether it saw correctly,
+so they inherit its blind spots. Use them for tuning and for catching regressions, and keep the
+hand-checked rows as the anchor - a model-derived label once quietly agreed with a hallucination
+here, and only reading the frame caught it.
+
+## Learning from the pipeline's own output
+
+Two optional models, trained from data the system produces as you use it. Neither exists until you
+train it, and every path falls back to the previous behaviour when the file is absent.
+
+### Candidate pre-filter, distilled from the verifier
+
+Every verified search appends one row per candidate to `local_data/learning/candidates.jsonl`: the
+features retrieval had already computed, and whether the vision model's verdict confirmed that
+candidate. A logistic regression learns to predict the verdict, and the pipeline then skips
+candidates the vision model would have rejected - which is where a verified search spends nearly all
+its time. The 4B vision model is the teacher; nothing is labeled by hand.
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.distill --dry-run   # describe what has been collected
+.\.venv\Scripts\python.exe -m bench.distill             # train it
+```
+
+The filter always keeps the strongest candidates whatever it believes, so a badly fitted model can
+cost time but can never empty the candidate list.
+
+### Query adapter, self-supervised from your own videos
+
+Each indexed chunk hands over free training pairs: the text the vision model wrote about a stretch
+of video, and the frame embeddings for that same stretch. Scene summaries, the search terms and
+actions the scene model listed, and the pseudo-queries `bench.synthesize` writes all describe the
+same spans; speech can be added with `--sources ...,speech`. A low-rank residual on the identity is
+fitted from query-text embeddings into the frame-embedding space by a contrastive loss, adapting
+retrieval to your footage without a single hand-labeled example.
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.adapt --dry-run   # pairs and the untrained baseline
+.\.venv\Scripts\python.exe -m bench.adapt             # train it
+```
+
+Four details decide whether the number it reports means anything:
+
+* **Negatives come from the same video.** Search never ranks one video's chunks against another's,
+  so neither does training or evaluation. Every negative is a different moment in the same place -
+  the only mistake retrieval can actually make.
+* **Spans are held out, not rows.** A span contributes a dozen texts and several frames. Splitting
+  by row would put a caption in training and its own twin in the holdout, and the score would
+  measure memorisation.
+* **Overlap and repeated wording are masked, not punished.** Medium chunks overlap by half, and the
+  scene model lists the same search term against a stretch of neighbours. Those pairs leave the
+  loss rather than being pushed apart; on the three videos here that is about a quarter of them.
+* **Training maximises what search scores.** A chunk is ranked by its best-matching view - whole
+  frame plus four tiles - so the loss takes the same maximum instead of the whole frame alone.
+
+It applies to queries only, never to stored vectors, so training a new one never invalidates an
+index. The script refuses to save an adapter that fails to beat the identity on held-out spans.
+On the three videos indexed here - 430 texts across 30 spans - it moves held-out recall@1 from
+42.5% to 46.0% with recall@5 unchanged, which on 87 held-out texts is three of them and well inside
+the noise. Treat a number like that as "nothing broke", not as a gain, and confirm any adapter
+against `bench.run` before trusting it.
+
 ## Project layout
 
 | Path | What it holds |
@@ -210,7 +281,8 @@ than fifty careless ones.
 | `video_retrieval/local_indexing.py` | Builds or loads a video's indexes |
 | `video_retrieval/pipeline.py` | `RetrievalResources` and `VideoRetrievalPipeline` |
 | `webapp/` | Local web app: Starlette API, job queue, library on disk, and the UI in `webapp/static/` |
-| `bench/` | Labeled query -> interval pairs and the accuracy runner |
+| `video_retrieval/learning.py` | The optional learned pieces: candidate pre-filter and query adapter |
+| `bench/` | Labeled and synthetic pairs, the accuracy runner, and the two trainers |
 | `model_completed.ipynb` | Notebook walkthrough of the same pipeline |
 
 ### Where data lives
@@ -222,6 +294,7 @@ local_data/library/<video id>/       source video, thumbnail, video.json
                     index/<hash>/    chunks, embeddings, transcript, scene descriptions
                     searches/<id>/   saved results with clips and frames
 local_data/cache/                    frame embeddings and transcripts, keyed by file identity
+local_data/learning/                 collected candidate outcomes and any trained models
 local_data/models/                   CLIP and Whisper weights
 ```
 

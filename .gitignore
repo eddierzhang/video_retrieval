@@ -24,3 +24,6 @@ transcript/
 *_transcript/
 transcript_index/
 *_transcript_index/
+
+# stray Cygwin crash dumps
+*.stackdump
