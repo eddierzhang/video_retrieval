@@ -4,7 +4,7 @@ from . import local_backend
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -432,16 +432,6 @@ class HierarchicalVideoIndex:
             first_scores,
             beam_size,
         )
-
-        selected_score_by_id = {
-            str(
-                self.metadata_by_scale[first_scale][idx].get(
-                    "chunk_id",
-                    idx,
-                )
-            ): float(first_scores[idx])
-            for idx in selected_indices
-        }
 
         selected_rows = [
             (

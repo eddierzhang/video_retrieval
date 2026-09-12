@@ -1,349 +1,301 @@
-> **Current UI default: Original architecture (local).** Uploads now use the
-> original hierarchical and multimodal pipeline with local model adapters.
-> See "Original architecture with local models" below for setup.
+# Moments — natural-language video retrieval, entirely local
 
-# Overview 
-This repository implements a zero-shot video retrieval pipeline that takes in a natural language query and returns the most relevant timestamped clips from a video. The main goal is to retrieve events that may depend on several types of information including: 
-- Visual appearance and actions
-- Spoken dialogue
-- OCR / visible text
-- Video metadata and scene descriptions
-- Temporal context across multiple time scales
+Ask a question about a video in plain English and get back timestamped clips:
 
-## Approach
-The pipeline follows a coarse to fine retrieval strategy:
+> *“when does someone get out of the car?”* · *“who says ‘thank you’?”* · *“read the license plate”*
 
+Every model runs on your machine — query planning, embeddings, transcription, scene
+descriptions, verification and OCR. No API key, no account, and no video ever leaves
+the computer.
+
+---
+
+## Quick start (Windows)
+
+Requirements: Python 3.11+, [FFmpeg](https://ffmpeg.org/download.html) (`ffmpeg` and
+`ffprobe` on `PATH`), and [Ollama](https://ollama.com/download/windows).
+
+```powershell
+python -m venv .venv
+# Optional but recommended on an NVIDIA GPU: CUDA build first, so CLIP and Whisper use it
+.\.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu126
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\start.ps1
+```
+
+`start.ps1` starts the Ollama server if it isn't already running, downloads the default
+model on first run (`qwen3.5:4b`, about 3.4 GB), and opens <http://127.0.0.1:8765>.
+
+The first search also downloads CLIP and Whisper weights (about 1 GB) into `local_data/models/`.
+After that the whole system works offline.
+
+## Using it
+
+1. **Add a video** — drag a file anywhere, or use *Add video*. MP4, MOV, MKV, WebM and AVI.
+2. **Wait for indexing** — this happens once per video. The player shows each stage as it runs;
+   you can watch the video meanwhile, and indexing resumes from finished work if you stop it.
+3. **Ask** — type a description, a spoken phrase, or text that appears on screen.
+   * **Verified** checks every candidate with the local vision model and tightens the clip
+     boundaries. Slower, and false positives are rejected.
+   * **Quick** ranks moments straight from the indexes in seconds, with no vision checks.
+4. **Read the answer** — each moment gives a clip, a confidence score, the evidence behind it,
+   and a frame strip. The timeline shows where the query found support across the whole video,
+   which regions were searched, and where the answers are.
+5. **Look under the hood** — the *Query plan* tab shows the route taken, the evidence the planner
+   decomposed your question into, how the retrieval channels were weighted, and the funnel from
+   candidates to confirmed matches. *Transcript* and *History* sit beside it.
+
+Settings (bottom-left) pick the local models and how many frames each vision call sees.
+Changing the planner or verifier takes effect immediately; changing the scene model or the frame
+count needs a re-index, and the app tells you so.
+
+### Measured on this machine (RTX 4080 SUPER, CUDA build of PyTorch)
+
+| Step | Time |
+| --- | --- |
+| Indexing a 21 s clip (first run, includes loading CLIP) | 30 s |
+| Verified search (1 candidate region → 5 occurrences → 1 confirmed) | 56 s |
+| Quick search | 13 s |
+| Text-reading search (“what file name is in the editor tab?”) | 24 s |
+
+Indexing cost is dominated by scene descriptions: roughly one vision call per 30 s of video
+(about 7 s each here), plus one pass of CLIP frame embeddings and one Whisper pass.
+Search cost is dominated by the vision calls in verification, so it grows with the number of
+candidates you allow, not with the length of the video.
+
+## What runs locally
+
+| Role in the pipeline | Model |
+| --- | --- |
+| Query planner | `qwen3.5:4b` via Ollama |
+| Scene descriptions, first verification pass, boundary refinement, OCR | `qwen3.5:4b` (vision) |
+| Second, stricter verification pass | `qwen3.5:4b` (configurable separately) |
+| Video and text embeddings | CLIP `openai/clip-vit-base-patch32`, mean-pooled over frames |
+| Speech transcription | faster-whisper `base`, with word timestamps |
+
+One multimodal model fills every role by default, so the GPU never swaps models mid-search.
+Any Ollama model with the `vision` capability can be substituted in settings; the planner slot
+accepts text-only models too.
+
+Vision models see sampled frames plus the transcript for the interval, not a native video stream.
+Sparse frames and small local models reduce accuracy on brief actions, small text, and fine
+temporal precision compared with large hosted models. No equivalence is claimed.
+
+---
+
+# How retrieval works
+
+The pipeline follows a coarse-to-fine strategy. Instead of processing every frame for every
+query, the video is indexed once into searchable chunks; a query then narrows broad regions down
+to precise timestamps.
+
+```
 Video
+  └─ hierarchical chunking (coarse 120 s · medium 30 s · fine 8 s, overlapping)
+      └─ feature extraction: CLIP frame embeddings · speech transcript · VLM scene metadata
+          └─ FAISS indexes + BM25
+Natural-language query
+  └─ query planner  → per-channel queries, atomic evidence predicates, weights
+      └─ multimodal retrieval (visual · scene · speech-semantic · speech-keyword)
+          └─ temporal evidence map → candidate regions → recursive refinement
+              └─ verification pass 1 → verification pass 2 → boundary refinement → temporal NMS
+                  └─ final timestamps, clips and frames (FFmpeg)
+```
 
-↓
+### 1. Hierarchical chunking
+The video is divided at several temporal scales. Large chunks preserve the context needed to
+recognize an event; small chunks localize it. Retrieval moves from coarse to fine.
 
-Hierarchical Video Chunking into Coarse-to-Fine Lengths
+### 2. Video embeddings
+Frames are sampled once per second and embedded with CLIP; a chunk's embedding is the normalized
+mean of the frames inside it, at every scale. Because each frame is embedded once and reused,
+adding scales costs almost nothing. A FAISS inner-product index over normalized vectors gives
+cosine similarity against the text query.
 
-↓
+### 3. Transcript retrieval
+Audio is transcribed once with word-level timestamps and split into overlapping windows. Both
+semantic (embedding) and BM25 (lexical) search run over it: embeddings catch paraphrase, BM25
+catches exact names and phrases.
 
-Feature / Metadata Extraction from Video Chunks
+### 4. Visual metadata
+Each medium chunk is described by the vision model as structured JSON (actions, people, objects,
+state changes, visible text, search terms). These descriptions are embedded and indexed, giving a
+second, independent visual channel that does not depend on the raw embedding.
 
-↓
+### 5. OCR / visual text
+When answering needs text that is visible on screen, a separate executor scans the video, then
+re-reads the best original-resolution frames and crops, and takes a consensus across readings.
 
-Multimodal Embeddings + Search Indexes
+### 6. Query planning
+One planner call routes the request (event search vs text reading) and decomposes it into
+per-channel queries plus 4–12 atomic evidence predicates, each with a role, the channels that can
+retrieve it, whether it is required, and how discriminative it is. It also returns negative
+evidence, temporal constraints, an expected duration, and channel weights.
 
-↓
+### 7. Evidence aggregation
+Every retrieval hit is mapped back onto a shared timeline. Within a query, overlapping hits
+combine with a noisy-OR so agreement creates a peak rather than a flat score; channels are then
+combined using the planner's weights. Scores are calibrated per ranking first, because raw scores
+from different modalities are not comparable.
 
-Natural-Language Query
+### 8. Candidate ranking
+Connected regions of the evidence map above a relative floor become candidates, ranked by peak
+score, total evidence mass, and supporting bins.
 
-↓
-
-Query Planner
-
-↓
-
-Video / Transcript / Metadata Retrieval
-
-↓
-
-Evidence / Potential Candidate Aggregation
-
-↓
-
-Candidate Ranking
-
-↓
-
-Recursive Temporal Refinement
-
-↓
-
-Verification
-
-↓
-
-Final Timestamp(s) + Video Clip(s)
-
-Instead of processing every frame of a long video for every query, the video is processed ahead of time and divided into searchable chunks. The system first identifies broad regions that may contain the requested event and then progressively searches smaller intervals to determine more precise timestamps.
-
-## Summary of the different files
-
-- `video_retrieval/config.py` — defines model names, endpoints, and API-key helpers.
-- `video_retrieval/video.py` — video chunking, VLM clip caching, frame extraction, and result materialization.
-- `video_retrieval/embeddings.py` — Creates Gemini embeddings for videos/text and FAISS indexing/searching.
-- `video_retrieval/metadata.py` — VLM metadata generation/indexing/search.
-- `video_retrieval/transcript.py` — Whisper transcription, semantic transcript search, and BM25 scores.
-- `video_retrieval/retrieval.py` — single-prompt router/query planner, multimodal retrieval, fusion, and candidate clustering.
-- `video_retrieval/verification.py` — temporal verification, multi-instance handling, boundary refinement, and temporal NMS.
-- `video_retrieval/visual_text.py` — open-vocabulary target-text extraction from arbitrary text-bearing objects/regions.
-- `video_retrieval/ocr.py` — compatibility wrappers for older OCR calls; new code normally does not call this directly.
-- `video_retrieval/pipeline.py` — top-level `RetrievalResources` and `VideoRetrievalPipeline` API.
-- `model_completed.ipynb` - Jupyter notebook to be run for demo 
-
-
-## Architecture
-
-### 1. Hierarchical Video Chunking
-
-The video is divided into multiple temporal scales, such as:
-
-Large chunks – broad sections of the video
-Medium chunks – narrower temporal regions
-Small chunks – fine-grained candidate intervals
-
-Videos are divided into in order to allow chunks of different lengths to highlight broader context (coarse) to specific actions (fine) and allow retrieval to move from a broad matching section to increasingly precise timestamps.
-
-### 2. Video Embeddings
-
-Video chunks are converted into numerical embeddings so that they can be compared against text queries through a shared embedding space. This allows text queries to be compared against video chunks. A FAISS index is then constructed over the embeddings for fast similarity search.
-
-### 3. Transcript Retrieval
-
-Audio is transcribed and associated with absolute timestamps. Transcript information is split into searchable segments so queries based on speech can be retrieved independently of visual information, helping to resolve queries related to audio.
-The system can use both semantic embedding similarity and BM25 keyword search, as BM25 is useful for exact words, names, or phrases, while embeddings are better for semantic similarity.
-
-### 4. Visual Metadata
-
-Video chunks can also be passed through a vision-language model to generate text descriptions of what occurs in the scene in a specific JSON format.
-
-Example metadata might look like: A police officer approaches a stopped vehicle at night. The driver is visible through the window.
-
-Metadata retrieval provides another way of searching visual information without relying entirely on the raw video embedding, improving redundancy.
-
-### 5. OCR / Visual Text
-
-Frames can also be processed to extract visible text. OCR results are timestamped and added to the searchable evidence associated with each video interval. This helps to resolve queries that may focus on extracting text from a video. 
-
-### 6. Query Planning
-
-Different questions require different retrieval channels, so the query planner converts the original query into specialized searches, such as: 
-
-{
-    "visual_queries": [...],
-    "transcript_queries": [...],
-    "metadata_queries": [...]
-}
-
-This allows different retrievers to focus on the part of the query they are best suited to answer. The query is also decomposed in order to allow for more targeted and accurate searching. 
-
-### 7. Evidence Aggregation
-
-Each retrieval system produces evidence for particular time intervals (candidates). These results are combined into a temporal evidence map, and intervals supported by multiple independent retrieval channels receive stronger evidence for being a valid candidate. This makes retrieval more robust than simply returning the highest FAISS similarity score through considereding multiple modalities.
-
-### 8. Candidate Ranking
-
-Candidate intervals are ranked using signals such as embedding similarity, transcript similarity, metadata similarity, BM25 score, and query relevance. Scores from different retrieval systems are calibrated before they are combined because their raw values are not necessarily directly comparable, resulting in a ranked collection of candidate intervals.
-
-### 9. Recursive Temporal Refinement
-
-Once a promising broad interval is identified, the system searches its child/sub chunks. This coarse-to-fine strategy greatly reduces the amount of video that must be examined during the final stages of retrieval.
+### 9. Recursive temporal refinement
+Promising regions are recursively subdivided into overlapping child windows, following the
+strongest evidence down to roughly the expected event duration. This avoids fine-grained search
+across the whole video.
 
 ### 10. Verification
+The highest-ranking candidates are inspected by the vision model, which finds every distinct
+occurrence inside a region; a second, stricter pass then re-checks each proposed occurrence and
+rejects near misses. Boundaries are refined by asking progressively shorter clips where the
+transition happens, and overlapping detections are removed by temporal NMS that preserves
+genuinely distinct actors.
 
-The highest-ranking candidate clips are inspected again using a VLM using visual, transcript, or multimodal evidence, which identifies false positives and helps reject clips that were semantically similar but did not actually contain the requested event.
+### 11. Final clip extraction
+FFmpeg cuts the matching interval from the original video and extracts frames for the UI.
 
-### 11. Final Clip Extraction
+---
 
-Once the final timestamps have been determined, FFmpeg extracts the matching portion directly from the original video.
+## Project layout
 
-## Running the Code 
-
-The easiest way to run the project is through the included Jupyter Notebook.
-
-### 1. Install Dependencies
-
-Install the Python packages required by the project by running pip install -r requirements.txt
-
-FFmpeg is also required for video processing and final clip extraction.
-
-On macOS:
-
-brew install ffmpeg
-
-### 2. Configure the Video
-
-Set the path to the video that should be indexed.
-
-For example: video_path = "videos/example.mp4"
-
-### 3. Run cells in the notebook in order 
-
-### 4. Run queries 
-
-New queries can be entered by modifying the PROMPT variable. 
-
-## Architecture Decisions 
-
-1. **Hierarchical chunking:** I used multi-scale video chunks because large chunks preserve the context needed to understand an event while smaller chunks provide more accurate timestamps, giving the system both efficient search and precise localization.
-2. **Separate retrieval channels:** I kept video, transcript, metadata, and OCR retrieval separate because each modality captures different information, allowing the system to route a query toward the strongest source instead of forcing every query through one model.
-3. **FAISS semantic search:** I used FAISS because it can search large collections of embedding vectors much faster than directly comparing a text query against every stored video chunk.
-4. **Semantic search + BM25:** I combined embedding-based semantic search with BM25 because embeddings are better at finding conceptually similar content while BM25 is more reliable for exact words, names, or phrases that may otherwise be missed.
-5. **Evidence-based ranking:** I combined evidence from multiple retrieval methods because agreement between video, transcript, and metadata signals is generally more reliable than selecting a result based on one similarity score alone.
-6. **Zero-shot pretrained models:** I relied on pretrained foundation models because this avoids the need for a labeled training dataset and allows the same system to handle many different types of videos and natural-language queries.
-7. **Recursive refinement:** I refined high-scoring coarse intervals into smaller child chunks because this avoids performing expensive fine-grained search across the entire video while still producing precise start and end timestamps.
-8. **Cached preprocessing:** I saved embeddings, metadata, transcripts, and search indexes because most of this information does not change between queries, making repeated searches over the same video significantly faster.
-9. **Query planning:** I used a query planner to break a natural-language request into modality-specific searches because different parts of a query may require visual, transcript, OCR, or temporal evidence.
-10. **Temporal evidence aggregation:** I mapped retrieval results back onto a shared video timeline because overlapping evidence from different sources makes it easier to identify the sections where an event is most likely to occur.
-11. **Final verification:** I added a verification stage because retrieval models can return clips that are semantically related but do not actually contain the requested event, so checking the strongest candidates helps reduce false positives.
-12. **Separate preprocessing and retrieval:** I separated the expensive video-processing stage from query-time retrieval so the video only needs to be indexed once, after which many different user queries can be answered efficiently.
-
-## What I Tried
-1. I initially tried implementing just single chunks, but it was difficult to determine the optimal length of the chunk that would capture as much information as possible. Thus, I decided to use hierarchical chunking instead. 
-2. I had initially tried solely relying on video and text embeddings, but I realized that this would not work well for more general prompts/prompts that required more reasoning, whihc led me to implement more retrieval channels. 
-3. I experimented with combining both semantic and BM25 metrics for audio analysis, since I noticed that exact language could behave differently from semantic meaning. 
-4. I tried implementing OCR for text-extraction queries specifically to extract text from videos, rather than just returning the video frames. 
-
-## Potential Tradeoffs 
-1. Accuracy vs Computation: More temporal scales and more retrieval channels improve the amount of available evidence but require additional storage and preprocessing, which may also be affected by OpenRouter's rate limits. 
-2. Context vs. temporal precision: Long clips tend to provide more contextual information, while shorter ones contain more accurate boundaries and specific actions. 
-3. Query Latency: I tried implementing precomputation for one video to reduce the amount of latency per query. 
-4. Generalized vs Specialized Inference: Since I used pretrained models, I didn't have to annotate any data specifically or retrain any models, which can be costly. However, training more specialized models could yield better performance. 
-
-## Future Works
-1. **Improve OCR:** Build a more robust video OCR pipeline using text detection, frame enhancement, multi-frame aggregation, and tracking to better recognize small or blurry text such as license plates and signs.
-2. **Add stronger temporal reasoning:** Extend the query planner to understand relationships such as before, after, during, and then by analyzing more video chunks, allowing the system to handle queries involving sequences of multiple events.
-3. **Improve ranking and score calibration:** Tune or learn how much weight to give video, transcript, metadata, OCR, and BM25 evidence for each query instead of relying mainly on manually selected scoring rules.
-4. **Build an annotated formal evaluation benchmark:** Create a labeled benchmark with ground-truth timestamps and query-event pairs to systematically evaluate retrieval accuracy, temporal localization, and overall system performance.
-
-## Local video-search UI
-
-The Streamlit prototype searches videos already indexed by `model_completed.ipynb`.
-It includes video selection, source playback, search settings, matching clips,
-confidence scores, query diagnostics, and downloadable JSON results.
-
-From the repository root in PowerShell:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-ui.txt
-$env:OPENROUTER_API_KEY = "your-key-here"
-.\.venv\Scripts\python.exe -m streamlit run app.py --server.address 127.0.0.1
-```
-
-Open the localhost URL printed by Streamlit. Keep this prototype local; it has no
-user authentication. Searches use the existing OpenRouter pipeline and incur its
-normal API usage. The key stays in the server environment, not in the UI or files.
-FFmpeg must be on PATH for verification and clip extraction.
-
-1. Select an indexed video from the sidebar. The app discovers `*chunks/manifest.json`
-   under the repository root, or accepts a custom manifest path.
-2. If the video moved, update **Source video path** to the same original video.
-3. Check **Index locations**: visual, metadata, and transcript indexes must all
-   belong to that video. Defaults follow the notebook's `video_16_*` naming pattern.
-4. Enter a query and click **Search video**. A status panel remains visible while
-   the existing pipeline runs; detailed pipeline logs remain in the terminal.
-5. Play matching clips or download the results JSON. OCR fields appear in match details.
-
-Indexes load once per browser session and configuration. Use **Reload indexes**
-if their contents change. Each search writes to its own `final_results/ui/` folder.
-The app does not upload or index new videos: prepare those in the notebook first.
-Generated data and secrets are ignored for new Git additions; previously tracked
-bytecode remains tracked and should not be included in source commits.
-
-UI API reference: [Streamlit documentation](https://docs.streamlit.io/develop/api-reference).
-
-
-## Upload videos without an API key
-
-The earlier simplified mode is available as **Local uploads (no key)**. Install the local dependencies:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-local.txt
-.\.venv\Scripts\python.exe -m streamlit run app.py --server.address 127.0.0.1
-```
-
-Upload a video, choose the frame sampling interval, optionally enable speech
-transcription, and click **Process uploaded video**. Once processing finishes,
-enter a visual description or search for words from the transcript. Results play
-from the matching timestamps and can be exported as JSON. The currently processed
-video is named above the search form; selecting another upload does not replace it
-until you click Process again.
-
-- Visual retrieval uses local CLIP (`openai/clip-vit-base-patch32`) on sampled frames.
-- Optional speech transcription uses faster-whisper's multilingual `base` model on
-  CPU with int8 computation. Speech search matches words, not semantic paraphrases.
-- No API key or hosted inference is used. First use requires internet to download
-  model weights; subsequent use can reuse the local cache. Videos stay on this machine.
-- Models, uploaded videos, and indexes are stored under ignored `local_data/`.
-  Reprocessing identical content with identical sampling settings reuses the visual
-  index. Reuploading after an app restart lets you reuse the saved processing.
-- Default upload limit is Streamlit's 200 MB; to increase it, append
-  `--server.maxUploadSize 1024` to the launch command. Videos are limited to two hours.
-- CPU processing can take time. Sparse frame sampling can miss brief actions;
-  visual scores are rankings, not calibrated confidence, and even unrelated queries
-  return nearest frames. This mode does not run Gemini verification, OCR, or complex
-  temporal reasoning. Video playback depends on browser codec support (H.264 MP4 is
-  the most portable choice).
-
-The original interface remains under **OpenRouter indexes** and still needs the
-original dependencies and an API key. Run regression tests with
-`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`.
-
-Model references: [CLIP](https://huggingface.co/openai/clip-vit-base-patch32),
-[faster-whisper](https://github.com/SYSTRAN/faster-whisper).
-
-
-## Original architecture with local models
-
-This is now the default UI mode. It preserves the original hierarchy, query planner,
-visual/metadata/transcript retrieval, semantic plus BM25 search, evidence fusion,
-recursive candidate refinement, first and second verification passes, boundary
-refinement, temporal NMS, OCR route, and final clip/frame extraction.
-
-Only model calls change:
-
-| Existing role | Local replacement |
+| Path | What it holds |
 | --- | --- |
-| Gemini multimodal embeddings | CLIP image/text embeddings, with normalized mean pooling over frames/text segments |
-| Whisper through OpenRouter | faster-whisper base, with word timestamps |
-| Query planner | Qwen2.5 7B through local Ollama |
-| Scene metadata, first verification, boundary refinement, OCR | Qwen2.5-VL 3B through local Ollama |
-| Second verification | A separate original verification pass using Qwen2.5-VL 3B by default; configurable model |
+| `video_retrieval/config.py` | Local model names, cache locations, Ollama URL |
+| `video_retrieval/local_backend.py` | The only place models are called: Ollama chat, CLIP, Whisper, frame sampling, progress and cancellation |
+| `video_retrieval/video.py` | Probing, hierarchical chunking, clip and frame extraction |
+| `video_retrieval/embeddings.py` | Chunk embeddings, hierarchical multi-scale index, FAISS |
+| `video_retrieval/metadata.py` | Scene description generation, embedding and search |
+| `video_retrieval/transcript.py` | Transcription, transcript windows, semantic + BM25 search |
+| `video_retrieval/retrieval.py` | Query planner, multimodal retrieval, evidence map, candidates |
+| `video_retrieval/verification.py` | Both verification passes, boundary refinement, temporal NMS |
+| `video_retrieval/visual_text.py` | Visual-text (OCR) executor |
+| `video_retrieval/local_indexing.py` | Builds or loads a video's indexes |
+| `video_retrieval/pipeline.py` | `RetrievalResources` and `VideoRetrievalPipeline` |
+| `webapp/` | Local web app: Starlette API, job queue, library on disk, and the UI in `webapp/static/` |
+| `model_completed.ipynb` | Notebook walkthrough of the same pipeline |
 
-The VLM receives timestamped sampled frames and locally transcribed speech, not a
-native video stream. Sparse frames and smaller local models can reduce action,
-OCR, temporal precision, and reasoning accuracy relative to the hosted models.
-The two verification stages remain separate but share the same default model.
-No accuracy equivalence is claimed. Increasing the frame limit trades speed and
-memory for coverage. CPU CLIP/Whisper and GPU Ollama can coexist.
+### Where data lives
 
-### Start on this machine
+Everything generated stays under `local_data/` (git-ignored):
 
-The project-local Ollama runtime and model are stored in ignored `local_data/`.
-In one PowerShell terminal, start the model server:
-
-```powershell
-.\start-local.ps1
+```
+local_data/library/<video id>/       source video, thumbnail, video.json
+                    index/<hash>/    chunks, embeddings, transcript, scene descriptions
+                    searches/<id>/   saved results with clips and frames
+local_data/cache/                    frame embeddings and transcripts, keyed by file identity
+local_data/models/                   CLIP and Whisper weights
 ```
 
-In another terminal:
+Videos are content-addressed, so uploading the same file twice reuses the existing entry. The index
+key covers only what changes an index's contents, so swapping the planner or verifier does not
+force a rebuild. Deleting a video in the UI removes all of it.
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-local.txt
-.\.venv\Scripts\python.exe -m streamlit run app.py --server.address 127.0.0.1
+### Security
+
+The server binds to `127.0.0.1` and has no authentication — it is a single-user local tool. Requests
+that change anything must carry an `X-Moments` header, which another website cannot send without a
+CORS preflight that this server never grants, and only loopback hostnames are accepted. Uploaded
+filenames are never used as paths, and files under a search are served only from inside that search's
+own directory.
+
+## Using the library directly
+
+```python
+from video_retrieval import LocalModels, prepare_video
+
+pipeline = prepare_video("videos/example.mp4", LocalModels(), reporter=print)
+result = pipeline.retrieve("a person getting out of a car")
+for match in result["matches"]:
+    print(match["start_timestamp"], match["end_timestamp"], match["confidence"], match["clip_path"])
 ```
 
-Open the displayed localhost URL, select **Original architecture (local)**,
-upload a video, and click **Process with original architecture**. When ready,
-enter a query and click **Search with original pipeline**. The status panel reports
-the active model stage; detailed per-chunk progress appears in the terminal.
-If a local Ollama server is already running, reuse it instead of starting another.
+`prepare_video` builds the indexes or loads them if they already exist. `retrieve` accepts
+`reporter=` for progress events, `cancel_event=` for cooperative cancellation, and
+`run_verification=False` for a retrieval-only search. `model_completed.ipynb` walks through the same
+steps one stage at a time.
 
-### Setup on another machine
+## Tests
 
-Install [Ollama](https://ollama.com/download/windows), run `start-local.ps1`, then
-run `ollama pull qwen2.5vl:3b` and `ollama pull qwen2.5:7b` in another terminal. The portable runtime may also
-be placed at `local_data/ollama_runtime/ollama.exe`. Install the Python dependencies
-above and ensure FFmpeg/ffprobe are on PATH. Initial downloads need internet but
-inference has no API key and sends requests only to the local Ollama service.
-See [Ollama Windows setup](https://docs.ollama.com/windows) and
-[structured outputs](https://docs.ollama.com/capabilities/structured-outputs).
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
 
-Uploads live under `local_data/<content hash>/`. Original-architecture indexes live
-under `architecture/<configuration hash>/` within that upload folder. The cache key
-includes local model identities/digests, source file identity, and sampling settings.
-Gemini indexes and the earlier simple frame-search index are not loaded into this
-pipeline. Reprocessing an identical upload reuses complete matching local indexes.
-Failed/incomplete indexing is not marked ready; retry to resume saved metadata and
-transcription work. Videos with no audio or no detected speech keep visual and
-metadata retrieval and have no transcript channel.
+The suite covers the model boundaries (nothing reaches the network except loopback), interval
+embedding and speech slicing, resumable scene description, cancellation, the retrieval-only path,
+and the web app's upload, indexing, search, settings and file-serving behavior.
 
-`VideoRetrievalPipeline` automatically activates local adapters when its resources
-contain `local_models`. For lower-level calls use `with use_local(LocalModels()):`.
-The local context is scoped to the operation, so another browser session using the
-legacy hosted mode cannot switch this session's backend. Invalid model JSON fails
-schema validation rather than being silently accepted as a verification result.
+---
+
+# Design notes
+
+These are the original architecture decisions for the retrieval pipeline, updated where the models
+changed.
+
+1. **Hierarchical chunking:** large chunks preserve the context needed to understand an event while
+   smaller chunks provide accurate timestamps, giving both efficient search and precise localization.
+2. **Separate retrieval channels:** video, transcript, metadata and OCR capture different
+   information, so a query can be routed toward its strongest source instead of forcing everything
+   through one model.
+3. **FAISS semantic search:** searching a large collection of embedding vectors is far faster than
+   comparing a query against every stored chunk.
+4. **Semantic search + BM25:** embeddings find conceptually similar content; BM25 is more reliable
+   for exact words, names or phrases.
+5. **Evidence-based ranking:** agreement between video, transcript and metadata signals is more
+   reliable than any single similarity score.
+6. **Zero-shot pretrained models:** no labelled dataset is needed, and the same system handles many
+   kinds of video and question.
+7. **Recursive refinement:** refining high-scoring coarse intervals into child windows avoids
+   expensive fine-grained search across the whole video.
+8. **Cached preprocessing:** embeddings, metadata, transcripts and indexes do not change between
+   queries, so repeated searches over one video stay fast.
+9. **Query planning:** different parts of a question need visual, transcript, OCR or temporal
+   evidence, so the planner decomposes it rather than embedding it whole.
+10. **Temporal evidence aggregation:** mapping results back onto a shared timeline makes overlapping
+    support from different sources visible as peaks.
+11. **Final verification:** retrieval returns semantically related clips that do not contain the
+    event, so checking the strongest candidates reduces false positives.
+12. **Separate preprocessing and retrieval:** a video is indexed once, after which many queries can
+    be answered against it.
+13. **One local runtime boundary:** every model call goes through `local_backend`, so models are
+    swapped, progress reported and work cancelled in one place rather than in each stage.
+
+## What I tried
+
+1. I initially tried single fixed-size chunks, but choosing one length that captured enough
+   information was difficult, which led to hierarchical chunking.
+2. I first relied only on video and text embeddings, which did not work well for general prompts or
+   prompts needing reasoning, so I added more retrieval channels.
+3. I experimented with combining semantic and BM25 scores for audio, since exact language behaves
+   differently from semantic meaning.
+4. I implemented OCR specifically for text-extraction queries, rather than returning frames and
+   leaving the reading to the user.
+
+## Trade-offs
+
+1. **Accuracy vs computation:** more temporal scales and channels give more evidence but cost
+   preprocessing time, disk and VRAM.
+2. **Context vs temporal precision:** long clips carry more context; short ones localize better.
+3. **Query latency:** precomputation per video keeps per-query latency down, at the cost of a
+   one-time indexing pass.
+4. **General vs specialized models:** pretrained models avoid annotation and retraining, but a
+   task-specific model would likely do better on any single task.
+5. **Local vs hosted models:** running locally removes API keys, costs and rate limits, and keeps
+   video private, but a 4B local model is weaker than a large hosted one at reading small text and
+   reasoning over long contexts.
+
+## Future work
+
+1. **Better OCR:** text detection, frame enhancement, multi-frame aggregation and tracking for small
+   or blurry text such as plates and signs.
+2. **Stronger temporal reasoning:** extend the planner to handle before/after/during and sequences
+   of several events.
+3. **Learned ranking:** tune or learn how much weight each channel deserves per query instead of
+   fixed rules.
+4. **An annotated benchmark:** ground-truth timestamps and query–event pairs to measure retrieval
+   accuracy and temporal localization properly.
+5. **Stronger local models where they pay off:** a larger CLIP for retrieval recall and a larger
+   Whisper for transcript quality, both of which fit alongside the vision model on a 16 GB GPU.
