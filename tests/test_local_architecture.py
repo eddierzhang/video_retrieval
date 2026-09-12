@@ -296,6 +296,59 @@ class LocalArchitectureTest(unittest.TestCase):
         self.assertIs(untouched, candidates)
         self.assertIsNone(absent)
 
+    def _rejecting_ranker(self):
+        from video_retrieval import learning
+
+        weights = np.zeros((len(learning.FEATURE_NAMES), 1))
+        weights[learning.FEATURE_NAMES.index("score"), 0] = -1.0
+        return {"mean": [0.0] * len(learning.FEATURE_NAMES), "std": [1.0] * len(learning.FEATURE_NAMES),
+                "layers": [{"w": weights.tolist(), "b": [0.0]}],
+                "platt": {"a": 1.0, "b": 0.0},
+                "conformal": {"threshold": 0.99, "coverage": 0.9}}
+
+    def test_selection_explores_past_its_own_beliefs(self):
+        from video_retrieval import learning
+
+        candidates = [{"candidate_id": i, "start": i * 10, "end": i * 10 + 8, "score": 1.0 - i * 0.1}
+                      for i in range(8)]
+        model = self._rejecting_ranker()
+        with patch.object(learning, "load_ranker", return_value=model):
+            # Exploring everything: the five the threshold rejected are verified anyway.
+            everything, info = learning.select_candidates(
+                candidates, [], {}, 100, keep_min=3, explore=1.0, rng=np.random.RandomState(0))
+            # Exploring nothing is the old behaviour exactly.
+            nothing, quiet = learning.select_candidates(
+                candidates, [], {}, 100, keep_min=3, explore=0.0, rng=np.random.RandomState(0))
+            half, sampled = learning.select_candidates(
+                candidates, [], {}, 100, keep_min=3, explore=0.5, rng=np.random.RandomState(0))
+        self.assertEqual((len(everything), info["explored"]), (8, 5))
+        self.assertEqual((len(nothing), quiet["explored"]), (3, 0))
+        self.assertTrue(all(row["explored"] for row in everything[3:]))
+        self.assertFalse(any(row["explored"] for row in everything[:3]))
+        # An explored row records the odds that brought it here, so training can correct for them.
+        self.assertTrue(all(row["propensity"] == 0.5 for row in half if row["explored"]))
+        self.assertTrue(all(row["propensity"] == 1.0 for row in half if not row["explored"]))
+        self.assertEqual(sampled["explored"], sum(row["explored"] for row in half))
+
+    def test_explored_rows_are_logged_with_their_propensity(self):
+        from bench.rank import group_searches
+        from video_retrieval import learning
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "candidates.jsonl"
+            with patch.object(learning, "CANDIDATE_EXAMPLES", path), patch.object(learning, "LEARNING_DIR", Path(folder)):
+                learning.log_candidates(
+                    [{"candidate_id": 0, "start": 0, "end": 8, "score": 0.9},
+                     {"candidate_id": 1, "start": 20, "end": 28, "score": 0.1,
+                      "explored": True, "propensity": 0.1}],
+                    [], {}, 40, "a person waves", survivors=[1])
+            rows = learning.load_examples(path)
+        self.assertEqual([row["explored"] for row in rows], [False, True])
+        # The rare explored row stands for the ten like it that were never verified.
+        group = group_searches(rows)[0]
+        np.testing.assert_allclose(group["weights"], [1.0, 10.0])
+        self.assertEqual(list(group["explored"]), [False, True])
+
     def test_ranking_rows_group_by_search_and_split_whole(self):
         from bench.rank import group_searches, split_searches
 

@@ -1,9 +1,11 @@
 """Train the candidate ranker and calibrate a conformal prediction set.
 
-    python -m bench.rank --dry-run          describe what has been collected
-    python -m bench.rank                    train every loss and keep the best
-    python -m bench.rank --loss listwise    train one
-    python -m bench.rank --alpha 0.2        accept 80% coverage for smaller sets
+    python -m bench.rank --dry-run           describe what has been collected
+    python -m bench.rank                     train every loss and keep the best
+    python -m bench.rank --loss listwise     train one
+    python -m bench.rank --alpha 0.2         accept 80% coverage for smaller sets
+    python -m bench.rank --learning-curve    is it short of data, or short of model?
+    python -m bench.rank --ablate            which features carry the signal
 
 Every verified search appends one row per candidate to local_data/learning/candidates.jsonl:
 the features retrieval had already computed, and whether the vision model's verdict confirmed
@@ -26,6 +28,11 @@ expensive question - a verified search spends nearly all its time there.
 
 The guarantee needs three disjoint splits - fit, calibrate, test - and whole searches on one
 side of each line, never individual candidates.
+
+Rows that the live ranker rejected but verified anyway are marked `explored`, and carry the
+probability with which they were sampled. Pointwise training divides by that probability, so a
+rare explored row counts for as much as the many confident ones it was sampled against; the
+ranking losses see it as one more member of its search, which is what it is.
 """
 from __future__ import annotations
 
@@ -47,6 +54,16 @@ from video_retrieval.learning import (
 )
 
 LOSSES = ("pointwise", "pairwise", "listwise")
+MAX_WEIGHT = 20.0  # a propensity of 1/20 is as much as one row is ever allowed to count
+
+FEATURE_GROUPS = {
+    "score": ("score", "relative_score"),
+    "evidence": ("evidence_mass", "supporting_bins"),
+    "duration": ("duration", "duration_ratio"),
+    "rank": ("rank",),
+    "channels": ("channel_video", "channel_metadata", "channel_speech", "channel_negative"),
+    "ordering": ("ordering",),
+}
 
 
 def group_searches(rows):
@@ -58,12 +75,15 @@ def group_searches(rows):
         searches.setdefault(key, []).append(row)
     groups = []
     for key, entries in searches.items():
+        propensity = np.array([float(entry.get("propensity", 1.0) or 1.0) for entry in entries])
         groups.append({
             "search": key,
             "query": entries[0].get("query"),
             "executor": entries[0].get("executor"),
             "features": np.stack([vectorize(entry["features"]) for entry in entries]),
             "labels": np.array([float(entry["label"]) for entry in entries]),
+            "weights": np.clip(1.0 / np.clip(propensity, 1e-6, None), 0.0, MAX_WEIGHT),
+            "explored": np.array([bool(entry.get("explored", False)) for entry in entries]),
         })
     return groups
 
@@ -75,6 +95,15 @@ def split_searches(groups, seed=0, fractions=(0.5, 0.25)):
     second = first + max(1, int(len(groups) * fractions[1]))
     pick = lambda indices: [groups[index] for index in indices]
     return pick(order[:first]), pick(order[first:second]), pick(order[second:])
+
+
+def feature_mask(dropped=()):
+    """A 1/0 vector over features, so an ablation is a multiply rather than a reshape."""
+    mask = np.ones(len(FEATURE_NAMES))
+    for group in dropped:
+        for name in FEATURE_GROUPS[group]:
+            mask[FEATURE_NAMES.index(name)] = 0.0
+    return mask
 
 
 # ------------------------------------------------------------------ metrics
@@ -113,10 +142,11 @@ def measure(groups, score_of, k=5):
 
 # ----------------------------------------------------------------- training
 
-def train(groups, loss_name, hidden=32, epochs=400, seed=0, verbose=False):
+def train(groups, loss_name, hidden=32, epochs=400, seed=0, mask=None, verbose=False):
     import torch
 
     torch.manual_seed(seed)
+    mask = np.ones(len(FEATURE_NAMES)) if mask is None else np.asarray(mask, dtype=np.float64)
     features = np.concatenate([group["features"] for group in groups])
     mean, std = features.mean(axis=0), features.std(axis=0)
     std = np.where(std > 0, std, 1.0)
@@ -126,8 +156,9 @@ def train(groups, loss_name, hidden=32, epochs=400, seed=0, verbose=False):
     if not usable:
         raise SystemExit(f"No search has both a confirmed and a rejected candidate, so a "
                          f"{loss_name} loss has nothing to learn from.")
-    tensors = [(torch.tensor((group["features"] - mean) / std, dtype=torch.float32),
-                torch.tensor(group["labels"], dtype=torch.float32)) for group in usable]
+    tensors = [(torch.tensor(((group["features"] - mean) / std) * mask, dtype=torch.float32),
+                torch.tensor(group["labels"], dtype=torch.float32),
+                torch.tensor(group["weights"], dtype=torch.float32)) for group in usable]
 
     sizes = [len(FEATURE_NAMES)] + ([hidden] if hidden else []) + [1]
     layers = []
@@ -141,10 +172,12 @@ def train(groups, loss_name, hidden=32, epochs=400, seed=0, verbose=False):
     for epoch in range(epochs):
         total = 0.0
         optimizer.zero_grad()
-        for inputs, labels in tensors:
+        for inputs, labels, weights in tensors:
             scores = model(inputs)[:, 0]
             if loss_name == "pointwise":
-                loss = torch.nn.functional.binary_cross_entropy_with_logits(scores, labels)
+                # Inverse propensity: a row that was sampled one time in ten stands for ten.
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    scores, labels, weight=weights)
             elif loss_name == "listwise":
                 # Softmax over the search; the target mass sits on the confirmed candidates.
                 log_probabilities = torch.log_softmax(scores, dim=0)
@@ -162,7 +195,7 @@ def train(groups, loss_name, hidden=32, epochs=400, seed=0, verbose=False):
         if isinstance(layer, torch.nn.Linear):
             weights.append({"w": layer.weight.detach().numpy().T.tolist(),
                             "b": layer.bias.detach().numpy().tolist()})
-    return {"mean": mean.tolist(), "std": std.tolist(), "layers": weights}
+    return {"mean": mean.tolist(), "std": std.tolist(), "mask": mask.tolist(), "layers": weights}
 
 
 def _lambda_rank(scores, labels):
@@ -223,7 +256,7 @@ def evaluate_sets(groups, probability_of, threshold, keep_min=3):
     for group in groups:
         probabilities = probability_of(group)
         order = list(np.argsort(-probabilities))
-        kept = [index for index in order if probabilities[index] >= threshold] or order[:keep_min]
+        kept = [index for index in order if probabilities[index] >= threshold]
         if len(kept) < keep_min:
             kept = order[:keep_min]
         kept_fraction.append(len(kept) / len(order))
@@ -238,17 +271,64 @@ def evaluate_sets(groups, probability_of, threshold, keep_min=3):
     }
 
 
-# --------------------------------------------------------------------- main
+# ------------------------------------------------------------------- driver
+
+def build(fit, calibration, test, loss_name, hidden, epochs, alpha, mask=None, verbose=False):
+    """Train, calibrate on the middle split, and measure on the last one."""
+    model = train(fit, loss_name, hidden=hidden, epochs=epochs, mask=mask, verbose=verbose)
+    score_of = lambda group: ranker_scores(model, group["features"])
+    model["platt"] = fit_platt(np.concatenate([score_of(group) for group in fit]),
+                               np.concatenate([group["labels"] for group in fit]))
+    probability_of = lambda group: ranker_probabilities(model, score_of(group))
+    conformal = calibrate_conformal(calibration, probability_of, alpha)
+    if not conformal:
+        raise SystemExit("No calibration search has a confirmed candidate; cannot calibrate.")
+    model["conformal"] = conformal
+    return {"model": model, "quality": measure(test, score_of),
+            "sets": evaluate_sets(test, probability_of, conformal["threshold"])}
+
 
 def describe(groups):
     sizes = [len(group["labels"]) for group in groups]
     positives = [int(group["labels"].sum()) for group in groups]
+    explored = sum(int(group["explored"].sum()) for group in groups)
     print(f"{sum(sizes)} candidates across {len(groups)} searches "
-          f"({np.mean(sizes):.1f} per search, {sum(positives)} confirmed)")
+          f"({np.mean(sizes):.1f} per search, {sum(positives)} confirmed, {explored} explored)")
     both = sum(1 for group in groups if 0 < group["labels"].sum() < len(group["labels"]))
     print(f"{both} searches have both a confirmed and a rejected candidate - "
           f"only those teach an ordering")
     return both
+
+
+def learning_curve(fit, calibration, test, loss_name, args, seed=0):
+    """Train on a growing slice of the fit split: is this short of data, or short of model?"""
+    print(f"\nlearning curve ({loss_name}, held-out ndcg@5)")
+    order = np.random.RandomState(seed).permutation(len(fit))
+    rows = []
+    for fraction in (0.25, 0.5, 0.75, 1.0):
+        take = max(2, int(len(fit) * fraction))
+        subset = [fit[index] for index in order[:take]]
+        try:
+            result = build(subset, calibration, test, loss_name, args.hidden, args.epochs, args.alpha)
+        except SystemExit as stop:
+            print(f"   {take:>4} searches   {stop}")
+            continue
+        rows.append((take, result["quality"]["ndcg"]))
+        print(f"   {take:>4} searches   ndcg@5 {result['quality']['ndcg']:.3f}")
+    if len(rows) >= 2:
+        slope = rows[-1][1] - rows[-2][1]
+        print(f"   the last {rows[-1][0] - rows[-2][0]} searches moved ndcg@5 by {slope:+.3f} - "
+              f"{'more data should still help' if slope > 0.01 else 'more data is not the bottleneck'}")
+
+
+def ablate(fit, calibration, test, loss_name, args, full):
+    """Drop each group of features and see what the ordering loses without them."""
+    print(f"\nfeature ablation ({loss_name}, held-out ndcg@5, full model {full:.3f})")
+    for name in FEATURE_GROUPS:
+        result = build(fit, calibration, test, loss_name, args.hidden, args.epochs, args.alpha,
+                       mask=feature_mask([name]))
+        score = result["quality"]["ndcg"]
+        print(f"   without {name:<10} {score:.3f}   {score - full:+.3f}")
 
 
 def main():
@@ -259,6 +339,8 @@ def main():
     parser.add_argument("--hidden", type=int, default=32, help="0 for a linear model")
     parser.add_argument("--epochs", type=int, default=400)
     parser.add_argument("--min-searches", type=int, default=20)
+    parser.add_argument("--learning-curve", action="store_true")
+    parser.add_argument("--ablate", action="store_true")
     parser.add_argument("--out", default=str(RANKER_MODEL))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -278,31 +360,20 @@ def main():
     print(f"searches: {len(fit)} fit, {len(calibration)} calibrate, {len(test)} test")
     raw = lambda group: group["features"][:, FEATURE_NAMES.index("score")]
     baseline = measure(test, raw)
-    print(f"\nbaseline - candidates in retrieval's own order")
+    print("\nbaseline - candidates in retrieval's own order")
     print(f"   ndcg@5 {baseline['ndcg']:.3f}   mrr {baseline['mrr']:.3f}   recall@3 {baseline['recall@3']:.3f}")
 
     results = {}
     for loss_name in (LOSSES if args.loss == "all" else (args.loss,)):
         print(f"\n{loss_name}")
-        model = train(fit, loss_name, hidden=args.hidden, epochs=args.epochs, verbose=True)
-        score_of = lambda group, model=model: ranker_scores(model, group["features"])
-        fit_scores = np.concatenate([score_of(group) for group in fit])
-        fit_labels = np.concatenate([group["labels"] for group in fit])
-        model["platt"] = fit_platt(fit_scores, fit_labels)
-        probability_of = lambda group, model=model: ranker_probabilities(model, score_of(group))
-
-        quality = measure(test, score_of)
-        conformal = calibrate_conformal(calibration, probability_of, args.alpha)
-        if not conformal:
-            raise SystemExit("No calibration search has a confirmed candidate; cannot calibrate.")
-        model["conformal"] = conformal
-        sets = evaluate_sets(test, probability_of, conformal["threshold"])
+        result = build(fit, calibration, test, loss_name, args.hidden, args.epochs, args.alpha, verbose=True)
+        conformal, quality, sets = result["model"]["conformal"], result["quality"], result["sets"]
         print(f"   ndcg@5 {quality['ndcg']:.3f}   mrr {quality['mrr']:.3f}   recall@3 {quality['recall@3']:.3f}")
         print(f"   conformal threshold {conformal['threshold']:.3f} from {conformal['calibration_searches']} searches")
         print(f"   test coverage {sets['coverage']:.1%} (target {conformal['coverage']:.0%})   "
               f"verifies {sets['candidates_kept']:.1%} of candidates   "
               f"keeps {sets['confirmed_kept']:.1%} of confirmed ones")
-        results[loss_name] = {"model": model, "quality": quality, "sets": sets}
+        results[loss_name] = result
 
     print("\n" + "-" * 78)
     print(f"{'loss':<12}{'ndcg@5':>9}{'mrr':>9}{'recall@3':>11}{'coverage':>11}{'verified':>11}")
@@ -314,8 +385,13 @@ def main():
               f"{result['sets']['candidates_kept']:>11.1%}")
 
     best = max(results, key=lambda name: results[name]["quality"]["ndcg"])
+    if args.learning_curve:
+        learning_curve(fit, calibration, test, best, args)
+    if args.ablate:
+        ablate(fit, calibration, test, best, args, results[best]["quality"]["ndcg"])
+
     if not results[best]["quality"]["ndcg"] > baseline["ndcg"]:
-        print(f"\nNo loss beat retrieval's own ordering on held-out searches, so nothing is saved.")
+        print("\nNo loss beat retrieval's own ordering on held-out searches, so nothing is saved.")
         print("Collect more verified searches and try again.")
         return
 

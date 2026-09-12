@@ -263,6 +263,27 @@ test        check the coverage actually delivered, and what it cost
 The floor from the pre-filter still applies: whatever the model believes, the strongest few
 candidates are always verified, so a badly fitted ranker can cost time but cannot empty the list.
 
+**Exploration keeps the loop honest.** A ranker that only ever collects rows about candidates it
+approved of cannot learn that it was wrong to reject something: it would narrow with every
+generation while the benchmark stayed silent, because the candidates it wrongly killed never
+appear anywhere. So one rejected candidate in ten is verified anyway. Those rows are marked
+`explored` and carry the probability that selected them, and pointwise training divides by it -
+a row sampled one time in ten stands for the ten like it that were not. It costs a little time
+per search and is the only thing keeping the next generation's data from being a picture of the
+last one's opinions.
+
+Two questions worth asking of any of this:
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.rank --learning-curve   # short of data, or short of model?
+.\.venv\Scripts\python.exe -m bench.rank --ablate           # which features carry the signal
+```
+
+The curve retrains on a growing slice of the fit split; if held-out NDCG is still climbing at the
+end, collecting more searches is worth more than a better model. The ablation drops each group of
+features and reports what the ordering loses without it, which is also how you find out that a
+feature you were proud of contributes nothing.
+
 ### Query adapter, self-supervised from your own videos
 
 Each indexed chunk hands over free training pairs: the text the vision model wrote about a stretch

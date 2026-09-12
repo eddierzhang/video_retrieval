@@ -29,6 +29,10 @@ PREFILTER_MODEL = LEARNING_DIR / "candidate_prefilter.json"
 RANKER_MODEL = LEARNING_DIR / "candidate_ranker.json"
 ADAPTER_MODEL = LEARNING_DIR / "query_adapter.npz"
 
+# How often a candidate the ranker rejected is verified anyway, so that the next generation
+# is trained on more than its own opinions. See `select_candidates`.
+EXPLORE_FRACTION = 0.10
+
 FEATURE_NAMES = (
     "score",
     "relative_score",
@@ -103,6 +107,10 @@ def log_candidates(candidates, evidence_map, plan, video_duration, query, surviv
                 "query": query,
                 "executor": (plan or {}).get("executor"),
                 "label": int(candidate.get("candidate_id") in survivors),
+                # Explored rows were sampled, not chosen, so training has to correct for the
+                # probability that brought them here rather than treat them as ordinary rows.
+                "explored": bool(candidate.get("explored", False)),
+                "propensity": float(candidate.get("propensity", 1.0)),
                 "features": features,
             }) + "\n")
 
@@ -193,6 +201,9 @@ def ranker_scores(model, matrix):
     mean = np.asarray(model["mean"], dtype=np.float64)
     std = np.asarray(model["std"], dtype=np.float64)
     values = (np.asarray(matrix, dtype=np.float64) - mean) / np.where(std > 0, std, 1.0)
+    if model.get("mask") is not None:
+        # An ablated model was fitted with some features held at zero; keep them there.
+        values = values * np.asarray(model["mask"], dtype=np.float64)
     layers = model["layers"]
     for index, layer in enumerate(layers):
         values = values @ np.asarray(layer["w"], dtype=np.float64) + np.asarray(layer["b"], dtype=np.float64)
@@ -209,12 +220,20 @@ def ranker_probabilities(model, scores):
     return 1.0 / (1.0 + np.exp(-(a * np.asarray(scores, dtype=np.float64) + b)))
 
 
-def select_candidates(candidates, evidence_map, plan, video_duration, keep_min=3):
+def select_candidates(candidates, evidence_map, plan, video_duration, keep_min=3,
+                      explore=EXPLORE_FRACTION, rng=None):
     """Order candidates by the learned ranker and keep a conformal prediction set.
 
     The threshold comes from split conformal calibration: on held-out searches, the set it
     produces contained a confirmed candidate at least `1 - alpha` of the time. That is a
     statement about coverage across searches, not about any single candidate being right.
+
+    A fraction of the *rejected* candidates is verified anyway. Without that, the only rows
+    this system ever collects again are candidates it already approved of: it would learn
+    that candidates like X are worthless, stop sending them to the vision model, and never
+    see evidence that it was wrong. Exploration costs a little time per search and is the
+    only thing keeping the next generation's training data honest. Explored rows are marked,
+    and carry the probability with which they were sampled so training can correct for it.
 
     Falls back to the pointwise pre-filter, and then to doing nothing at all, so an untrained
     system behaves exactly as it did before.
@@ -234,16 +253,24 @@ def select_candidates(candidates, evidence_map, plan, video_duration, keep_min=3
     conformal = model.get("conformal") or {}
     threshold = float(conformal.get("threshold", 0.0))
 
-    order = list(np.argsort(-scores))
+    order = [int(index) for index in np.argsort(-scores)]
     kept = [index for index in order if probabilities[index] >= threshold]
     if len(kept) < keep_min:
         kept = order[:keep_min]  # the floor: a bad model can cost time, never empty the list
+    chosen = set(kept)
+    generator = rng if rng is not None else np.random
+    explore = max(0.0, min(1.0, float(explore)))
+    explored = [index for index in order
+                if index not in chosen and generator.uniform() < explore]
+
     selected = []
-    for position, index in enumerate(kept):
+    for position, index in enumerate(kept + explored):  # explored go last: they are extra work
         candidate = dict(candidates[index])
         candidate["ranker_score"] = float(scores[index])
         candidate["ranker_probability"] = float(probabilities[index])
         candidate["ranker_position"] = position
+        candidate["explored"] = index not in chosen
+        candidate["propensity"] = explore if index not in chosen else 1.0
         selected.append(candidate)
     return selected, {
         "model": "ranker",
@@ -254,7 +281,8 @@ def select_candidates(candidates, evidence_map, plan, video_duration, keep_min=3
         "before": len(candidates),
         "after": len(selected),
         "skipped": len(candidates) - len(selected),
-        "reordered": [int(index) for index in kept] != sorted(int(index) for index in kept),
+        "explored": len(explored),
+        "reordered": kept != sorted(kept),
     }
 
 
