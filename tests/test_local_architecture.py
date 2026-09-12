@@ -285,7 +285,8 @@ class LocalArchitectureTest(unittest.TestCase):
                  "platt": {"a": 1.0, "b": 0.0},
                  "conformal": {"threshold": 0.99, "coverage": 0.9}}
         with patch.object(learning, "load_ranker", return_value=model):
-            kept, info = learning.select_candidates(candidates, [], {}, 100, keep_min=3)
+            # explore=0 isolates the threshold and the floor; exploration has its own test.
+            kept, info = learning.select_candidates(candidates, [], {}, 100, keep_min=3, explore=0.0)
         self.assertEqual(len(kept), 3)          # the threshold rejects everything; the floor holds
         self.assertEqual(info["before"], 8)
         self.assertEqual(kept[0]["candidate_id"], 7)  # the inverted ranking really is applied

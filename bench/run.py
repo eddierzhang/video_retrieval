@@ -180,10 +180,17 @@ def main():
 
     models = LocalModels()
     pipelines = load_pipelines(rows, Library(), models)
-    measured = []
+    measured, failed = [], []
     with tempfile.TemporaryDirectory() as temp:
         for row in rows:
-            measured.append(run_row(pipelines[row["video"]], row, Path(temp)))
+            try:
+                measured.append(run_row(pipelines[row["video"]], row, Path(temp)))
+            except Exception as exc:
+                # A local model returning unusable JSON is a property of the row, not a
+                # reason to throw away every row after it - these runs take hours.
+                failed.append({"id": row["id"], "error": f"{type(exc).__name__}: {exc}"})
+                print(f"[fail] {row['id']:<18} {type(exc).__name__}: {exc}", flush=True)
+                continue
             print(format_row(measured[-1]), flush=True)
 
     result = {
@@ -192,8 +199,12 @@ def main():
         "models": models.signature(),
         "summary": summarize(measured),
         "rows": measured,
+        "failed": failed,
     }
     print("\nsummary:", json.dumps(result["summary"]))
+    if failed:
+        print(f"{len(failed)} row(s) failed and were skipped: " +
+              ", ".join(row["id"] for row in failed))
     RESULTS.mkdir(parents=True, exist_ok=True)
     out = Path(args.out) if args.out else RESULTS / f"{datetime.now():%Y%m%d-%H%M%S}.json"
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")
