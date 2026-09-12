@@ -231,6 +231,13 @@ Rules:
 - Confidence is from 0 to 1.
 - If the event is absent, return present=false and instances=[].
 - Do not count merely related context unless it satisfies the target event.
+- Judge only from the sampled frames and the transcript below. If they do not
+  show the event, it did not happen in this clip.
+- Anchor start_seconds and end_seconds to the listed frame times. Do not invent
+  a moment between frames that you cannot actually see.
+- Spoken content counts only where the transcript contains it.
+- Confidence expresses how directly this evidence shows the event, not how
+  plausible the event would be in general.
 """
 
         result = call_video_json(
@@ -352,6 +359,10 @@ Return valid=true only if the complete requested event is actually visible.
 If valid, give your best adjusted start/end offsets relative to this clip.
 Use the tightest interval containing the complete event.
 If invalid, set start_seconds=-1 and end_seconds=-1.
+
+Judge only from the sampled frames and the transcript below. Reject the
+occurrence when the evidence merely suggests it, shows something similar, or
+shows only the surrounding context.
 """
 
     result = call_video_json(
@@ -515,6 +526,9 @@ If the requested {boundary_word} boundary is visible, set contains_boundary=true
 and boundary_seconds to its offset from the beginning of this short clip.
 If it is not visible, set contains_boundary=false and boundary_seconds=-1.
 Do not use timestamps from outside this clip.
+The frames are sparse samples: choose the sampled moment where the change is
+first visible, rather than guessing a time between two frames that does not
+show it.
 """
 
             result = call_video_json(

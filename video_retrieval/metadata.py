@@ -136,71 +136,50 @@ VIDEO_METADATA_SCHEMA = {
 
 #Caption Prompt
 METADATA_PROMPT = """
-Analyze this video for a temporal video retrieval system.
+Describe this passage of video so it can be found later by a text search.
 
-Your goal is to preserve as much SEARCHABLE visual information as possible.
+You are given sampled frames in chronological order and, when there is speech,
+the transcript for the same interval. The frames are sparse samples: describe
+only what they actually show, and never invent what happens between them.
 
-Describe only things supported by the video. Do not guess hidden events,
-identities, intentions, dialogue, or details that cannot be seen.
+The video could be anything - a lecture, a cooking video, a sports broadcast, a
+screen recording, an interview, a home video, a fixed security camera. Do not
+assume a setting or a subject.
 
-Pay particular attention to:
+Record, as far as the evidence supports:
 
-1. Actions
-   - walking
-   - running
-   - entering/exiting
-   - opening/closing
-   - grabbing
-   - reaching
-   - sitting/standing
-   - driving
-   - interacting with another person
-   - object manipulation
+1. Actions, in plain verbs: walking, entering, opening, lifting, typing, pouring,
+   pointing, handing something over, driving, demonstrating.
 
-2. State changes
-   Example:
-   person inside car -> car door opens -> person exits car
+2. State changes, as a before-to-after transition.
+   Example: a door is shut, a hand turns the handle, the door stands open.
 
-3. People
-   - clothing
-   - approximate role if visually obvious
-   - position
-   - distinguishing visual characteristics
+3. People: how many, what they wear, where they are, and what distinguishes them.
+   Give a role only when it is visually obvious. Do not guess identity, age,
+   relationships, or intent.
 
-4. Objects
-   - vehicles
-   - bags
-   - tools
-   - phones
-   - weapons if clearly visible
-   - doors
-   - furniture
-   - equipment
+4. Objects that matter to the scene, including anything prominent or unusual.
 
-5. Interactions between people and objects.
+5. Interactions between people, and between people and objects.
 
-6. Scene/environment
-   - indoors/outdoors
-   - road
-   - building
-   - parking lot
-   - daylight/night
-   - weather if visible
+6. The setting: indoors or outdoors, the kind of place, time of day and weather
+   if visible, and what is displayed if this is a recording of a screen.
 
-7. Motion events and transitions.
+7. Motion and camera changes, such as a pan, a cut, or a static camera.
 
-8. Any readable visible text.
-   Only record text that can actually be read.
+8. Text that is genuinely readable in the frames. Never guess at blurred text.
 
-9. Important temporal events.
-   Provide approximate start/end offsets relative to the BEGINNING
-   OF THIS CLIP.
+9. Important events, with approximate start and end offsets in seconds from the
+   BEGINNING OF THIS CLIP.
 
-10. Search terms.
-    Include useful synonymous concepts someone might use when searching
-    for this scene.
+10. Search terms: words someone might plausibly search for to find this passage,
+    including synonyms for the actions and objects that appear.
 
-Make the summary detailed rather than generic.
+For anything spoken, rely on the supplied transcript. Never invent dialogue, and
+do not report speech that the transcript does not contain.
+
+Write the summary densely and factually, favoring concrete nouns and verbs over
+interpretation, so that matching it against a search query is easy.
 """
 
 #Analyze one interval of the source video with the local vision model and return structured metadata

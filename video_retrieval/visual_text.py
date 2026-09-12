@@ -219,7 +219,7 @@ Rules:
 - Only use text that is visibly present in the video frames. Do not use spoken audio.
 - start_seconds/end_seconds are relative to the beginning of THIS clip.
 - best_frame_seconds is the moment where the requested text-bearing target is largest, sharpest, least occluded, and most readable.
-- ocr_text must contain ONLY the requested text type. Do not return nearby unrelated writing, logos, license plates, unit numbers, labels, or other text unless they are exactly what the prompt requests. Preserve spaces and punctuation when they matter.
+- ocr_text must contain ONLY the requested text type. Ignore other writing that merely happens to be nearby, such as logos, captions, watermarks, burnt-in timestamps, or a different label on the same object, unless that is exactly what the prompt asks for. Preserve spaces and punctuation when they matter.
 - Never invent hidden, blurred, cropped, or ambiguous characters.
 - If only part is reliably readable, return only the visible portion and set readable=false.
 - If the target is visible but no requested characters are reliable, use ocr_text="" and readable=false.

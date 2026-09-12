@@ -50,7 +50,7 @@ class LocalModels:
     def index_signature(self):
         """Settings that change what a saved index contains (planner/verifier do not)."""
         return {
-            "version": 3,
+            "version": 4,
             "embedding": f"{CLIP_MODEL}@{FRAME_EMBEDDING_FPS:g}fps-mean",
             "transcription": f"faster-whisper-{WHISPER_MODEL}",
             "scene_model": self.vision,

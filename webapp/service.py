@@ -107,7 +107,9 @@ class Service:
             "has_preview": (self.library.root / record["id"] / "preview.mp4").is_file(),
             "jobs": [job.to_dict() for job in self.jobs.active(record["id"])],
             "index_outdated": bool(built_with) and (
-                built_with.get("scene_model") != settings.vision or built_with.get("frame_limit") != settings.frame_limit
+                built_with.get("scene_model") != settings.vision
+                or built_with.get("frame_limit") != settings.frame_limit
+                or built_with.get("version") != settings.index_signature()["version"]
             ),
         }
 
