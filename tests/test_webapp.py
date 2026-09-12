@@ -108,7 +108,7 @@ class WebAppTest(unittest.TestCase):
             job = self.jobs.run_next(timeout=1)
         self.assertEqual(job.status, "done", job.error)
         self.assertFalse(self.pipeline.retrieve.call_args.kwargs["run_verification"])
-        self.assertEqual(self.pipeline.retrieve.call_args.kwargs["max_candidates"], 10)
+        self.assertEqual(self.pipeline.retrieve.call_args.kwargs["max_candidates"], 12)
 
         result = self.client.get(f"/api/videos/{video['id']}/searches/{search['id']}").json()["result"]
         match = result["matches"][0]

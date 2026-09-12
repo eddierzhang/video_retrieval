@@ -27,8 +27,8 @@ python -m venv .venv
 needs on first run (`qwen3.5:4b` and `nomic-embed-text`, about 3.7 GB together), and opens
 <http://127.0.0.1:8765>.
 
-The first search also downloads CLIP and Whisper weights (about 1 GB) into `local_data/models/`.
-After that the whole system works offline.
+The first index also downloads the SigLIP 2 and Whisper weights (about 1.5 GB) into
+`local_data/models/`. After that the whole system works offline.
 
 ## Using it
 
@@ -54,17 +54,18 @@ count needs a re-index, and the app tells you so.
 
 | Step | Time |
 | --- | --- |
-| Indexing a 21 s clip (first run, includes loading CLIP) | 51 s |
-| Indexing a 104 s clip with speech | 51 s |
-| Verified search | 56 s |
-| Quick search | 14 s |
-| Text-reading search ("what file name is in the editor tab?") | 28 s |
+| Indexing a 21 s clip | 15 s |
+| Indexing a 104 s clip with speech | 78 s |
+| Indexing a 5:47 clip with speech | 157 s |
+| Quick search | 19 s |
+| Text-reading search | 39 s |
+| Verified search | 40-130 s, depending on how many candidates survive |
 
-Indexing cost is dominated by scene descriptions - roughly one vision call per 30 s of video,
-about 7 s each here - plus one pass of CLIP frame embeddings (five views per frame, so five
-times the embedding work that a single whole-frame pass would cost) and one Whisper pass.
-Search cost is dominated by the vision calls in verification, so it grows with the number of
-candidates you allow and how finely each one is split, not with the length of the video.
+Indexing cost is dominated by scene descriptions - roughly one vision call per 30 s of video, about
+7 s each here - plus one pass of frame embeddings (five views per frame, so five times the embedding
+work of a single whole-frame pass) and one Whisper pass. Search cost is dominated by the vision calls
+in verification, so it grows with the number of candidates you allow and how finely each one is
+split, not with the length of the video.
 
 ## What runs locally
 
@@ -73,7 +74,7 @@ candidates you allow and how finely each one is split, not with the length of th
 | Query planner | `qwen3.5:4b` via Ollama |
 | Scene descriptions, first verification pass, boundary refinement, OCR | `qwen3.5:4b` (vision) |
 | Second, stricter verification pass | `qwen3.5:4b` (configurable separately) |
-| Frame embeddings | CLIP `openai/clip-vit-base-patch32`, whole frame plus 2x2 tiles |
+| Frame embeddings | SigLIP 2 `google/siglip2-base-patch16-224`, whole frame plus 2x2 tiles |
 | Scene and transcript embeddings | `nomic-embed-text` via Ollama |
 | Speech transcription | faster-whisper `base`, with word timestamps |
 
@@ -111,19 +112,19 @@ The video is divided at several temporal scales. Large chunks preserve the conte
 recognize an event; small chunks localize it. Retrieval moves from coarse to fine.
 
 ### 2. Video embeddings
-Frames are sampled once per second and embedded with CLIP. Each frame is embedded twice over: once
-whole, and once per tile of a 2x2 grid. CLIP resizes whatever it is given to 224 px, so a detail
-occupying a tenth of a 4K frame is a handful of pixels by the time the model sees it; the tiles
-give that detail a view of its own. A chunk keeps one vector per view, mean-pooled over its frames,
+Frames are sampled once per second and embedded with SigLIP 2, which outperforms CLIP ViT-B/32 at a
+similar size. Each frame is embedded five times over: once whole, and once per tile of a 2x2 grid.
+The model resizes whatever it is given to 224 px, so a detail occupying a tenth of a 4K frame is a
+handful of pixels by the time it is seen; the tiles give that detail a view of its own. A chunk keeps one vector per view, mean-pooled over its frames,
 and scores against a query by its **best-matching view**, so a match in one corner is not averaged
 away by three quiet ones. Each frame is still embedded only once and reused across all scales.
 
 ### 3. Transcript retrieval
 Audio is transcribed once with word-level timestamps and split into overlapping windows. Both
 semantic (embedding) and BM25 (lexical) search run over it: embeddings catch paraphrase, BM25
-catches exact names and phrases. The semantic side uses a dedicated text embedder rather than
-CLIP, whose text tower is capped at 77 tokens and trained on image captions - a poor fit for
-sentences of speech.
+catches exact names and phrases. The semantic side uses a dedicated text embedder rather than the
+image-text model, whose text tower is trained on short captions and capped well below the length of
+a paragraph - a poor fit for sentences of speech.
 
 ### 4. Visual metadata
 Each medium chunk is described by the vision model as structured JSON (actions, people, objects,
@@ -145,11 +146,15 @@ evidence, temporal constraints, an expected duration, and channel weights.
 Every retrieval hit is mapped back onto a shared timeline. Within a query, overlapping hits
 combine with a noisy-OR so agreement creates a peak rather than a flat score; channels are then
 combined using the planner's weights. Scores are calibrated per ranking first, because raw scores
-from different modalities are not comparable.
+from different modalities are not comparable. The planner also names confounders it wants rejected;
+those are retrieved the same way and **subtracted** from the map, so a region that looks like the
+wrong thing scores lower rather than merely failing to score higher.
 
 ### 8. Candidate ranking
 Connected regions of the evidence map above a relative floor become candidates, ranked by peak
-score, total evidence mass, and supporting bins.
+score, total evidence mass, and supporting bins. When the request needs one thing to happen before
+another, the planner returns that as a pair of evidence-predicate ids, and candidates whose evidence
+peaks in the required order are promoted over candidates where it appears reversed.
 
 ### 9. Recursive temporal refinement
 Promising regions are recursively subdivided into overlapping child windows, following the
@@ -170,6 +175,25 @@ FFmpeg cuts the matching interval from the original video and extracts frames fo
 
 ---
 
+## Measuring accuracy
+
+Changes to prompts, models or thresholds trade recall against precision in ways that are easy to
+feel and hard to see, so there is a small benchmark:
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.run                                  # every row
+.\.venv\Scripts\python.exe -m bench.run --compare bench\results\<file>  # against an earlier run
+```
+
+Rows live in `bench/dataset.json`: a video in the library, a query, and either a true interval
+(scored by temporal IoU, with recall at 0.3 and 0.5) or the exact characters a text query should
+return. Results are written to `bench/results/` so two runs can be diffed row by row.
+
+The dataset ships with three starter rows and only one of them has boundaries checked by eye - it
+is a smoke test, not a benchmark, until you add your own. To label a row: play the video in the app,
+note when the event really starts and ends, and append an entry. Ten careful rows are worth more
+than fifty careless ones.
+
 ## Project layout
 
 | Path | What it holds |
@@ -186,6 +210,7 @@ FFmpeg cuts the matching interval from the original video and extracts frames fo
 | `video_retrieval/local_indexing.py` | Builds or loads a video's indexes |
 | `video_retrieval/pipeline.py` | `RetrievalResources` and `VideoRetrievalPipeline` |
 | `webapp/` | Local web app: Starlette API, job queue, library on disk, and the UI in `webapp/static/` |
+| `bench/` | Labeled query -> interval pairs and the accuracy runner |
 | `model_completed.ipynb` | Notebook walkthrough of the same pipeline |
 
 ### Where data lives

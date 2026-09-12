@@ -128,6 +128,55 @@ class LocalArchitectureTest(unittest.TestCase):
                 local.check_runtime(local.LocalModels())
         self.assertIn("nomic-embed-text", str(error.exception))
 
+    def test_negative_evidence_lowers_the_evidence_map(self):
+        from video_retrieval.retrieval import build_temporal_evidence_map
+
+        plan = {"weights": {"video": 1.0, "metadata": 0.0, "transcript_semantic": 0.0, "transcript_bm25": 0.0}}
+        hit = [{"start": 10, "end": 18, "score": 0.9, "_predicate_importance": 1.0}]
+        empty = {"metadata": [], "transcript_semantic": [], "transcript_bm25": []}
+        without = build_temporal_evidence_map({"video": [hit], "negative": [], **empty}, plan, video_duration=40)
+        against = build_temporal_evidence_map({"video": [hit], "negative": [list(hit)], **empty}, plan, video_duration=40)
+        self.assertGreater(max(row["score"] for row in without), max(row["score"] for row in against))
+        self.assertGreaterEqual(min(row["score"] for row in against), 0.0)
+
+    def test_temporal_ordering_reranks_candidates(self):
+        from video_retrieval.retrieval import apply_temporal_ordering
+
+        def ranking(predicate, start, end):
+            return [{"start": start, "end": end, "score": 0.9, "_predicate_id": predicate, "_predicate_importance": 1.0}]
+
+        results = {
+            "video": [ranking("a", 0, 4), ranking("b", 10, 14), ranking("b", 30, 34), ranking("a", 40, 44)],
+            "metadata": [], "transcript_semantic": [], "transcript_bm25": [], "negative": [],
+        }
+        plan = {"ordering": [{"first": "a", "then": "b", "description": "a before b"}]}
+        candidates = [{"candidate_id": 0, "start": 30, "end": 50, "score": 0.5},
+                      {"candidate_id": 1, "start": 0, "end": 20, "score": 0.5}]
+        ordered = apply_temporal_ordering(candidates, results, plan)
+        self.assertEqual(ordered[0]["start"], 0)
+        self.assertEqual(ordered[0]["ordering_satisfied"], 1)
+        self.assertEqual(ordered[-1]["ordering_violated"], 1)
+        # With no ordering to enforce, candidates come back untouched.
+        self.assertEqual(apply_temporal_ordering(candidates, results, {}), candidates)
+
+    def test_planner_keeps_only_ordering_between_real_predicates(self):
+        raw = {
+            "executor": "temporal_grounding",
+            "weights": {"video": 1, "metadata": 0, "transcript_semantic": 0, "transcript_bm25": 0},
+            "evidence_predicates": [
+                {"id": "a", "description": "first thing", "role": "target", "modalities": ["video"], "required": True, "importance": 0.9},
+                {"id": "b", "description": "second thing", "role": "cue", "modalities": ["video"], "required": False, "importance": 0.5},
+            ],
+            "ordering": [
+                {"first": "a", "then": "b", "description": "a before b"},
+                {"first": "a", "then": "ghost", "description": "names a predicate that does not exist"},
+                {"first": "a", "then": "a", "description": "self reference"},
+            ],
+        }
+        with patch.object(local, "chat_json", return_value=raw):
+            plan = plan_query("something happens and then something else")
+        self.assertEqual([(rule["first"], rule["then"]) for rule in plan["ordering"]], [("a", "b")])
+
     def test_verification_windows_stay_short_enough_to_see_detail(self):
         import inspect
 

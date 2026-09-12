@@ -7,6 +7,7 @@ from typing import Any
 from . import local_backend
 from .local_backend import LocalModels, use_models
 from .retrieval import (
+    apply_temporal_ordering,
     build_temporal_evidence_map,
     candidates_from_evidence_map,
     cluster_fused_results,
@@ -224,6 +225,9 @@ def retrieve_video(
         )
     else:
         candidates = initial_candidates
+
+    # Ordering constraints only make sense once candidate windows exist.
+    candidates = apply_temporal_ordering(candidates, retrieval_results, plan)
 
     if max_candidates is not None:
         candidates = candidates[:max_candidates]

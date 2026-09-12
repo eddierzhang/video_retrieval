@@ -1,5 +1,6 @@
 .venv/
 local_data/
+bench/results/
 .vscode/
 __pycache__/
 *.py[cod]

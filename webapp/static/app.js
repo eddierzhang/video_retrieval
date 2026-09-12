@@ -404,8 +404,8 @@ function setMode(mode) {
   storage.set('moments.mode', mode);
   for (const button of els.modeButtons) button.setAttribute('aria-checked', String(button.dataset.mode === mode));
   els.optRefine.disabled = mode === 'quick';
-  if (mode === 'quick' && Number(els.optCandidates.value) === 12) setCandidates(10);
-  if (mode === 'verified' && Number(els.optCandidates.value) === 10) setCandidates(12);
+  if (mode === 'quick' && Number(els.optCandidates.value) === 20) setCandidates(12);
+  if (mode === 'verified' && Number(els.optCandidates.value) === 12) setCandidates(20);
 }
 
 function setCandidates(value) {
@@ -642,6 +642,15 @@ function renderPlan() {
       blocks.push(section('What counts', h('div', { class: 'definition' },
         h('div', {}, h('h4', {}, icon('check', 14), 'Counts'), h('ul', {}, (definition.counts_as_match || []).map((x) => h('li', {}, x)))),
         h('div', {}, h('h4', {}, icon('x', 14), 'Doesn’t count'), h('ul', {}, (definition.does_not_count || []).map((x) => h('li', {}, x)))))));
+    }
+    const negatives = plan.negative_evidence || [];
+    if (negatives.length) {
+      blocks.push(section('Confounders it rejects', h('ul', { class: 'plain-list' }, negatives.map((text) => h('li', {}, text)))));
+    }
+    const ordering = plan.ordering || [];
+    if (ordering.length) {
+      blocks.push(section('Required order', h('ul', { class: 'plain-list' }, ordering.map((rule) =>
+        h('li', {}, `${rule.first} before ${rule.then}${rule.description ? ` - ${rule.description}` : ''}`)))));
     }
     const steps = [
       [d.num_candidates, 'Candidate regions'],

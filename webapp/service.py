@@ -226,7 +226,7 @@ class Service:
         return {
             "refine_boundaries": bool(raw.get("refine_boundaries", True)),
             "min_confidence": number("min_confidence", 0.25, 0.0, 1.0),
-            "max_candidates": number("max_candidates", 10 if mode == "quick" else 12, 1, 50, int),
+            "max_candidates": number("max_candidates", 12 if mode == "quick" else 20, 1, 50, int),
         }
 
     def _run_search(self, job, search_id):

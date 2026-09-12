@@ -252,7 +252,7 @@ input[type="range"] { accent-color: var(--accent); width: 100%; margin: 0; }
 .definition { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .definition h4 { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; font-size: 12.5px; }
 .definition h4 svg { color: var(--muted); }
-.definition ul { margin: 0; padding-left: 18px; color: var(--text-2); font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+.definition ul, .plain-list { margin: 0; padding-left: 18px; color: var(--text-2); font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
 .funnel { display: flex; gap: 8px; flex-wrap: wrap; }
 .funnel-step { flex: 1; min-width: 100px; padding: 10px 12px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--line); }
 .funnel-n { display: block; font: 600 22px/1.2 var(--font-display); }

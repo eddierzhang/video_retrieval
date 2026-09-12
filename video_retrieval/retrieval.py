@@ -1,6 +1,12 @@
 #Query planning, multimodal retrieval, fusion, and initial candidate clustering.
 from __future__ import annotations
 
+# How hard planner-supplied confounders push an interval down, and how much a
+# satisfied or violated ordering constraint moves a candidate.
+NEGATIVE_EVIDENCE_WEIGHT = 0.5
+ORDERING_SATISFIED_BOOST = 1.15
+ORDERING_VIOLATED_PENALTY = 0.75
+
 from . import local_backend
 
 import math
@@ -121,6 +127,10 @@ cue, or a spoken phrase. For each predicate:
 - importance is 0..1 and reflects how discriminative that predicate is.
 Also return negative_evidence for confounders that should reject a candidate and
 temporal_constraints for ordering/state-transition requirements.
+When the event genuinely requires one piece of evidence to come BEFORE another,
+also fill ordering with entries naming evidence_predicates ids, for example
+first="vehicle_moving" then="vehicle_stopped". Leave ordering empty when the
+parts may happen in any order; most requests do not need it.
 
 Examples, taken from deliberately different kinds of video:
 - 'someone opens a laptop' decomposes into a closed laptop in view, a hand on the
@@ -227,6 +237,19 @@ General planning rules:
                 "type": "array",
                 "items": {"type": "string"},
             },
+            "ordering": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "first": {"type": "string"},
+                        "then": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["first", "then", "description"],
+                    "additionalProperties": False,
+                },
+            },
             "subevents": {
                 "type": "array",
                 "items": {
@@ -297,6 +320,7 @@ General planning rules:
             "evidence_predicates",
             "negative_evidence",
             "temporal_constraints",
+            "ordering",
             "subevents",
             "expected_duration",
             "requires_temporal_order",
@@ -333,6 +357,7 @@ General planning rules:
         plan["evidence_predicates"] = []
         plan["negative_evidence"] = []
         plan["temporal_constraints"] = []
+        plan["ordering"] = []
     else:
         # Text-specific fields are intentionally empty for normal temporal search.
         plan["target_object"] = ""
@@ -386,6 +411,20 @@ General planning rules:
             str(x).strip()
             for x in plan.get("temporal_constraints", [])
             if str(x).strip()
+        ]
+
+        # Ordering only means something when both sides name a real predicate.
+        known_predicates = {p["id"] for p in cleaned_predicates}
+        plan["ordering"] = [
+            {
+                "first": str(rule.get("first", "")),
+                "then": str(rule.get("then", "")),
+                "description": str(rule.get("description", "")),
+            }
+            for rule in plan.get("ordering", [])
+            if str(rule.get("first", "")) in known_predicates
+            and str(rule.get("then", "")) in known_predicates
+            and str(rule.get("first", "")) != str(rule.get("then", ""))
         ]
 
         weights = {
@@ -495,6 +534,8 @@ def run_retrieval_plan(
         "metadata": [],
         "transcript_semantic": [],
         "transcript_bm25": [],
+        # Confounders the planner wants rejected; subtracted from the evidence map.
+        "negative": [],
     }
 
     weights = plan.get("weights", {})
@@ -544,6 +585,25 @@ def run_retrieval_plan(
             )
             results["transcript_bm25"].append(
                 _annotate_ranking(ranking, spec, "transcript_bm25")
+            )
+
+    for i, text in enumerate(plan.get("negative_evidence", [])):
+        spec = {
+            "query": str(text).strip(),
+            "predicate_id": f"negative_{i}",
+            "predicate_role": "negative",
+            "predicate_required": False,
+            "importance": 1.0,
+        }
+        if not spec["query"]:
+            continue
+        if video_index is not None and video_metadata:
+            results["negative"].append(
+                _annotate_ranking(search_video(spec["query"], video_index, video_metadata, top_k=top_k), spec, "negative")
+            )
+        if metadata_index is not None and metadata_records:
+            results["negative"].append(
+                _annotate_ranking(search_metadata(spec["query"], metadata_index, metadata_records, top_k=top_k), spec, "negative")
             )
 
     return results
@@ -766,10 +826,12 @@ def build_temporal_evidence_map(
     bin_size = max(0.1, float(bin_size))
     n_bins = max(1, int(math.ceil(video_duration / bin_size)))
     channels = ["video", "metadata", "transcript_semantic", "transcript_bm25"]
-    channel_maps = {channel: [0.0] * n_bins for channel in channels}
-    channel_support = {channel: [0] * n_bins for channel in channels}
+    # "negative" is mapped exactly like a channel, then subtracted instead of added.
+    mapped = channels + ["negative"]
+    channel_maps = {channel: [0.0] * n_bins for channel in mapped}
+    channel_support = {channel: [0] * n_bins for channel in mapped}
 
-    for channel in channels:
+    for channel in mapped:
         query_maps = []
         query_support_maps = []
 
@@ -843,6 +905,8 @@ def build_temporal_evidence_map(
         score = 0.0
         for channel in channels:
             score += max(0.0, float(weights.get(channel, 0.0))) * channel_maps[channel][i]
+        # A confounder pulls its bin down; it can never push the score below zero.
+        score -= NEGATIVE_EVIDENCE_WEIGHT * channel_maps["negative"][i]
         total_scores[i] = max(0.0, min(1.0, score))
 
     evidence_map = []
@@ -857,7 +921,7 @@ def build_temporal_evidence_map(
             "score": score,
             "channel_scores": {
                 channel: channel_maps[channel][i]
-                for channel in channels
+                for channel in mapped
             },
             "channel_query_support": {
                 channel: channel_support[channel][i]
@@ -1123,6 +1187,62 @@ def recursive_refine_candidates(
         candidate["candidate_id"] = i
 
     return deduped
+
+
+#Best-scoring moment inside a window for each evidence predicate
+def _predicate_peaks(retrieval_results, start, end):
+    peaks = {}
+    for rankings in retrieval_results.values():
+        for ranking in rankings:
+            for item, score in zip(ranking, _calibrate_ranking_scores(ranking)):
+                predicate = item.get("_predicate_id")
+                if not predicate or score <= 0:
+                    continue
+                center = (float(item.get("start", 0.0)) + float(item.get("end", 0.0))) / 2.0
+                if not (start <= center < end):
+                    continue
+                if score > peaks.get(predicate, (0.0, 0.0))[0]:
+                    peaks[predicate] = (score, center)
+    return {predicate: center for predicate, (_, center) in peaks.items()}
+
+
+#Reward candidates whose evidence appears in the order the planner asked for
+def apply_temporal_ordering(candidates, retrieval_results, plan):
+    """Re-rank candidates by whether required orderings hold inside them.
+
+    The planner emits ordering as pairs of evidence-predicate ids. A candidate
+    where the first predicate peaks before the second is promoted; one where they
+    appear in the wrong order is demoted. Candidates missing either predicate are
+    left untouched, since absence is not evidence of the wrong order.
+    """
+    ordering = plan.get("ordering") or []
+    if not ordering or not candidates:
+        return candidates
+
+    output = []
+    for candidate in candidates:
+        row = candidate.copy()
+        peaks = _predicate_peaks(retrieval_results, float(row["start"]), float(row["end"]))
+        satisfied = violated = 0
+        for rule in ordering:
+            first, then = peaks.get(rule.get("first")), peaks.get(rule.get("then"))
+            if first is None or then is None:
+                continue
+            if first <= then:
+                satisfied += 1
+            else:
+                violated += 1
+        if satisfied or violated:
+            factor = (ORDERING_SATISFIED_BOOST ** satisfied) * (ORDERING_VIOLATED_PENALTY ** violated)
+            row["score"] = float(row.get("score", 0.0)) * factor
+            row["ordering_satisfied"] = satisfied
+            row["ordering_violated"] = violated
+        output.append(row)
+
+    output.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    for i, row in enumerate(output):
+        row["candidate_id"] = i
+    return output
 
 
 def format_timestamp(seconds):

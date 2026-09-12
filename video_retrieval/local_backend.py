@@ -27,7 +27,6 @@ from tqdm import tqdm
 
 from .config import (
     CACHE_DIR,
-    CLIP_MODEL,
     DEFAULT_PLANNER_MODEL,
     DEFAULT_VERIFIER_MODEL,
     DEFAULT_VISION_MODEL,
@@ -35,6 +34,7 @@ from .config import (
     MODEL_CACHE_DIR,
     OLLAMA_URL,
     TEXT_EMBEDDING_MODEL,
+    VISUAL_MODEL,
     VISUAL_TILE_GRID,
     WHISPER_MODEL,
 )
@@ -47,13 +47,13 @@ class LocalModels:
     planner: str = DEFAULT_PLANNER_MODEL
     vision: str = DEFAULT_VISION_MODEL
     verifier: str = DEFAULT_VERIFIER_MODEL
-    frame_limit: int = 12
+    frame_limit: int = 20
 
     def index_signature(self):
         """Settings that change what a saved index contains (planner/verifier do not)."""
         return {
-            "version": 5,
-            "embedding": f"{CLIP_MODEL}@{FRAME_EMBEDDING_FPS:g}fps-mean-{VISUAL_TILE_GRID}x{VISUAL_TILE_GRID}tiles",
+            "version": 6,
+            "embedding": f"{VISUAL_MODEL}@{FRAME_EMBEDDING_FPS:g}fps-mean-{VISUAL_TILE_GRID}x{VISUAL_TILE_GRID}tiles",
             "text_embedding": TEXT_EMBEDDING_MODEL,
             "transcription": f"faster-whisper-{WHISPER_MODEL}",
             "scene_model": self.vision,
@@ -270,32 +270,35 @@ def images_json(images, prompt, schema, role="vision"):
 # --------------------------------------------------------------------- CLIP
 
 @lru_cache(maxsize=1)
-def clip_model():
+def visual_model():
+    """The image-text model used for frame and visual-query embeddings."""
     import torch
-    from transformers import CLIPModel, CLIPProcessor
+    from transformers import AutoModel, AutoProcessor
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
     kwargs = dict(cache_dir=str(MODEL_CACHE_DIR))
     try:
-        processor = CLIPProcessor.from_pretrained(CLIP_MODEL, local_files_only=True, use_fast=False, **kwargs)
-        model = CLIPModel.from_pretrained(CLIP_MODEL, local_files_only=True, dtype=dtype, **kwargs)
+        processor = AutoProcessor.from_pretrained(VISUAL_MODEL, local_files_only=True, **kwargs)
+        model = AutoModel.from_pretrained(VISUAL_MODEL, local_files_only=True, dtype=dtype, **kwargs)
     except OSError:
-        processor = CLIPProcessor.from_pretrained(CLIP_MODEL, use_fast=False, **kwargs)
-        model = CLIPModel.from_pretrained(CLIP_MODEL, dtype=dtype, **kwargs)
+        processor = AutoProcessor.from_pretrained(VISUAL_MODEL, **kwargs)
+        model = AutoModel.from_pretrained(VISUAL_MODEL, dtype=dtype, **kwargs)
     return torch, processor, model.to(device).eval(), device, dtype
 
 
 def encode(images=None, text=None):
-    """L2-normalized CLIP features for RGB images or one or more strings."""
-    torch, processor, model, device, dtype = clip_model()
+    """L2-normalized visual-model features for RGB images or one or more strings."""
+    torch, processor, model, device, dtype = visual_model()
     with torch.inference_mode():
         if images is not None:
             pixels = processor(images=list(images), return_tensors="pt")["pixel_values"]
             features = model.get_image_features(pixel_values=pixels.to(device, dtype))
         else:
             texts = [text] if isinstance(text, str) else list(text)
-            inputs = processor(text=texts, return_tensors="pt", padding=True, truncation=True)
+            # SigLIP is trained with a fixed 64-token padding; anything else degrades it.
+            padding = {"padding": "max_length", "max_length": 64} if "siglip" in VISUAL_MODEL else {"padding": True}
+            inputs = processor(text=texts, return_tensors="pt", truncation=True, **padding)
             features = model.get_text_features(**{key: value.to(device) for key, value in inputs.items()})
         features = features.float()
         features = features / features.norm(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -303,7 +306,7 @@ def encode(images=None, text=None):
 
 
 def embed_text(text):
-    # Mean-pool 40-word pieces to cover long metadata/transcripts beyond CLIP's 77 tokens.
+    # Mean-pool 40-word pieces so long text is not truncated by the model's context.
     words = str(text).split()
     pieces = [" ".join(words[i:i + 40]) for i in range(0, len(words), 40)] or [""]
     vector = encode(text=pieces).mean(axis=0)
@@ -363,7 +366,7 @@ def frame_views(frame, grid=VISUAL_TILE_GRID):
 
 def frame_embeddings(video_path, fps=FRAME_EMBEDDING_FPS):
     """CLIP embeddings for each frame sampled at `fps`, shaped (frames, views, dim)."""
-    key = _file_key(video_path, CLIP_MODEL, fps, VISUAL_TILE_GRID)
+    key = _file_key(video_path, VISUAL_MODEL, fps, VISUAL_TILE_GRID)
     return _frame_embeddings(str(Path(video_path).resolve()), key, float(fps))
 
 

@@ -10,7 +10,9 @@ CACHE_DIR = DATA_DIR / "cache"
 # Loopback only: chat requests never leave this machine.
 OLLAMA_URL = "http://127.0.0.1:11434"
 
-CLIP_MODEL = "openai/clip-vit-base-patch32"
+# SigLIP 2 outperforms CLIP ViT-B/32 at a similar size and runs in the same shape;
+# any HF image-text model exposing get_image_features / get_text_features works here.
+VISUAL_MODEL = "google/siglip2-base-patch16-224"
 FRAME_EMBEDDING_FPS = 1.0
 # Each frame is embedded whole and as a GRID x GRID tiling, so detail that CLIP's
 # 224px crop would otherwise destroy stays searchable. 1 disables tiling.

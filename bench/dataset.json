@@ -1,0 +1,53 @@
+{
+  "about": [
+    "Hand-labeled ground truth for measuring retrieval accuracy. Run it with: python -m bench.run",
+    "",
+    "Every row names a video in the library, a query, and what a correct answer looks like:",
+    "  expect.start / expect.end  a true interval in seconds, scored by temporal IoU",
+    "  expect.text                the exact characters a text-reading query should return",
+    "",
+    "To add a row: play the video in the app, note when the event really starts and ends,",
+    "and append an entry with a unique id. Ten careful rows beat fifty careless ones - the",
+    "metrics are only ever as trustworthy as these labels.",
+    "",
+    "label_confidence is a note to yourself. 'high' means the boundaries were checked by eye;",
+    "'approximate' means the row is a placeholder worth tightening before you trust a delta."
+  ],
+  "rows": [
+    {
+      "id": "editor-filename",
+      "video": "Screen recording.mp4",
+      "mode": "verified",
+      "query": "what file name is shown in the editor tab?",
+      "expect": {
+        "text": "ModifiedDFC_2_T4.ipynb"
+      },
+      "label_confidence": "high",
+      "note": "Read off the frames at 2s and 18s: the active editor tab is ModifiedDFC_2_T4.ipynb. Both the pre-SigLIP and post-SigLIP runs hallucinated different names here, which is the point of the row. The earlier label was itself taken from a model answer - never do that."
+    },
+    {
+      "id": "code-scroll",
+      "video": "Screen recording.mp4",
+      "mode": "verified",
+      "query": "scrolling through code in an editor",
+      "expect": {
+        "start": 0.0,
+        "end": 21.1
+      },
+      "label_confidence": "approximate",
+      "note": "The clip is one continuous scroll, so almost any overlapping answer is defensible. Tighten this if you want the row to discriminate."
+    },
+    {
+      "id": "robot-pole",
+      "video": "Sample clip.mov",
+      "mode": "quick",
+      "query": "a robot climbing a vertical pole",
+      "expect": {
+        "start": 30.0,
+        "end": 60.0
+      },
+      "label_confidence": "approximate",
+      "note": "Taken from the indexed scene description rather than checked by eye. Verify and tighten before trusting it."
+    }
+  ]
+}
