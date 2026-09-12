@@ -82,6 +82,8 @@ def retrieve_video(
     pro_min_confidence=0.25,
     run_pro_verification=True,
     run_verification=True,
+    verifier_window_seconds=25.0,
+    verifier_overlap_seconds=5.0,
     refine_boundaries=True,
     refinement_stages=(8.0, 4.0, 2.0),
     nms_iou_threshold=0.55,
@@ -244,6 +246,8 @@ def retrieve_video(
             query,
             plan=plan,
             min_confidence=flash_min_confidence,
+            verifier_window_seconds=verifier_window_seconds,
+            verifier_overlap_seconds=verifier_overlap_seconds,
         )
         diagnostics["num_flash_instances"] = len(instances)
 

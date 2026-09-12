@@ -11,8 +11,9 @@ import threading
 import time
 
 from video_retrieval.config import DATA_DIR
-from video_retrieval.local_backend import LocalModels, capabilities, check_runtime, devices, installed_models
-from video_retrieval.local_indexing import INDEX_STAGES, index_key, load_index, prepare_video
+from video_retrieval.local_backend import LocalModels, capabilities, check_runtime, devices, installed_models, installed_names
+from video_retrieval.config import TEXT_EMBEDDING_MODEL
+from video_retrieval.local_indexing import INDEX_STAGES, IndexVersionMismatch, index_key, load_index, prepare_video
 from video_retrieval.pipeline import SEARCH_STAGES
 
 from .jobs import Job, JobQueue
@@ -91,7 +92,7 @@ class Service:
             }
             for name, row in sorted(installed.items())
         ]
-        status["missing_models"] = sorted({models.planner, models.vision, models.verifier} - set(installed))
+        status["missing_models"] = sorted({models.planner, models.vision, models.verifier, TEXT_EMBEDDING_MODEL} - installed_names(installed))
         return status
 
     # ---------------------------------------------------------------- videos
@@ -185,6 +186,9 @@ class Service:
         record = self.library.get(video_id)
         if not record.get("index"):
             raise LibraryError("This video needs to finish indexing before it can be searched.")
+        built_version = (record["index"].get("models") or {}).get("version")
+        if built_version != self.settings().index_signature()["version"]:
+            raise LibraryError("Re-index this video before searching: it was built by an earlier version of the pipeline.")
         query = " ".join(str(query or "").split())
         if not query:
             raise LibraryError("Describe what you are looking for.")
@@ -265,7 +269,10 @@ class Service:
                 self._pipelines.move_to_end(key)
                 return self._pipelines[key]
         folder = self.library.video_dir(video_id)
-        pipeline = load_index(folder / record["index"]["dir"], self.settings(), folder / record["source"])
+        try:
+            pipeline = load_index(folder / record["index"]["dir"], self.settings(), folder / record["source"])
+        except IndexVersionMismatch as exc:
+            raise LibraryError(str(exc))
         self._remember_pipeline(key, pipeline)
         return pipeline
 

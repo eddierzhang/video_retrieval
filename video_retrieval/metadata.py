@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .embeddings import embed_text, normalize_embedding
+from .embeddings import embed_document, embed_query, normalize_embedding
 
 #Metadata to include and extract from the video
 VIDEO_METADATA_SCHEMA = {
@@ -363,7 +363,7 @@ def embed_metadata_records(
         success = False
         for attempt in range(retry_count):
             try:
-                embedding = embed_text(text)
+                embedding = embed_document(text)
                 embedding = normalize_embedding(embedding)
                 success = True
                 break
@@ -452,7 +452,7 @@ def search_metadata(
     top_k=10,
 ):
 
-    query_embedding = embed_text(query)
+    query_embedding = embed_query(query)
 
     query_embedding = normalize_embedding(query_embedding)
 

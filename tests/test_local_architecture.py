@@ -44,20 +44,99 @@ class LocalArchitectureTest(unittest.TestCase):
             {"chunk_id": "fine_1", "start": 4, "end": 12},
         ]}}
         with tempfile.TemporaryDirectory() as folder, patch.object(
-            local, "embed_video_interval", side_effect=lambda path, start, end: np.full(4, start, np.float32)
+            local, "embed_video_interval", side_effect=lambda path, start, end: np.full((2, 4), start, np.float32)
         ) as embed:
             vectors, rows = embed_scale(manifest, "fine", save_dir=folder)
         self.assertEqual([call.args for call in embed.call_args_list], [("v.mp4", 0.0, 8.0), ("v.mp4", 4.0, 12.0)])
-        self.assertEqual(vectors.shape, (2, 4))
+        self.assertEqual(vectors.shape, (2, 2, 4))  # chunks, views, dim
         self.assertEqual([row["chunk_id"] for row in rows], ["fine_0", "fine_1"])
 
-    def test_interval_embedding_means_cached_frames(self):
-        times, vectors = np.arange(10, dtype=np.float32), np.eye(10, dtype=np.float32)
+    def test_interval_embedding_pools_each_view_over_time(self):
+        times = np.arange(10, dtype=np.float32)
+        # Two views per frame: a constant whole-frame view and a tile that changes.
+        vectors = np.zeros((10, 2, 3), dtype=np.float32)
+        vectors[:, 0, 0] = 1.0
+        vectors[2, 1, 1] = 1.0
+        vectors[3, 1, 2] = 1.0
         with patch.object(local, "frame_embeddings", return_value=(times, vectors)):
             inside = local.embed_video_interval("v.mp4", 2, 4)
             outside = local.embed_video_interval("v.mp4", 20, 22)
-        np.testing.assert_allclose(inside, (vectors[2] + vectors[3]) / np.sqrt(2), atol=1e-6)
-        np.testing.assert_allclose(outside, vectors[9])
+        self.assertEqual(inside.shape, (2, 3))
+        np.testing.assert_allclose(inside[0], [1, 0, 0], atol=1e-6)
+        np.testing.assert_allclose(inside[1], [0, 1 / np.sqrt(2), 1 / np.sqrt(2)], atol=1e-6)
+        # Outside every frame, the nearest frame is used as-is.
+        np.testing.assert_allclose(outside, [[1, 0, 0], [0, 0, 0]], atol=1e-6)
+
+    def test_frame_views_tile_the_image(self):
+        frame = np.zeros((48, 64, 3), dtype=np.uint8)
+        views = local.frame_views(frame, grid=2)
+        self.assertEqual(len(views), 5)
+        self.assertEqual(views[0].shape, (48, 64, 3))
+        self.assertTrue(all(view.shape == (24, 32, 3) for view in views[1:]))
+
+    def test_index_scores_a_chunk_by_its_best_view(self):
+        from video_retrieval.embeddings import HierarchicalVideoIndex
+
+        # Chunk 0 matches weakly as a whole; chunk 1 matches only in one tile.
+        vectors = np.array([[[1, 0], [1, 0]], [[0.2, 0.98], [0, 1]]], dtype=np.float32)
+        rows = [{"chunk_id": "a", "start": 0, "end": 8, "duration": 8},
+                {"chunk_id": "b", "start": 8, "end": 16, "duration": 8}]
+        index = HierarchicalVideoIndex({"fine": vectors}, {"fine": rows})
+        scores, ids = index.search(np.array([[0, 1]], dtype=np.float32), 2)
+        self.assertEqual(int(ids[0][0]), 1)
+        self.assertAlmostEqual(float(scores[0][0]), 1.0, places=5)
+
+    def test_text_embeddings_use_the_dedicated_model_and_task_prefixes(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {"embeddings": [[3.0, 4.0]]}
+        with patch("requests.post", return_value=response) as post:
+            document = local.embed_document("a person opens a door")
+            self.assertEqual(post.call_args.args[0], "http://127.0.0.1:11434/api/embed")
+            payload = post.call_args.kwargs["json"]
+            self.assertEqual(payload["model"], "nomic-embed-text")
+            self.assertTrue(payload["input"].startswith("search_document: "))
+            local.embed_query("door opening")
+            self.assertTrue(post.call_args.kwargs["json"]["input"].startswith("search_query: "))
+        np.testing.assert_allclose(document, [0.6, 0.8], atol=1e-6)  # normalized
+
+    def test_index_built_by_an_older_version_is_refused(self):
+        from video_retrieval.local_indexing import IndexVersionMismatch, load_index
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)
+            (path / "ready.json").write_text(json.dumps({"models": {"version": 1}, "has_transcript": False}))
+            with self.assertRaises(IndexVersionMismatch):
+                load_index(path)
+
+    def test_faiss_index_accepts_multi_view_embeddings(self):
+        from video_retrieval.embeddings import build_faiss_index
+
+        # A [:, 0] view of a 3-D array is not contiguous; FAISS refuses those.
+        index = build_faiss_index(np.random.rand(3, 5, 8).astype(np.float32))
+        self.assertEqual((index.ntotal, index.d), (3, 8))
+
+    def test_untagged_model_names_match_latest_tags(self):
+        # Ollama reports an untagged pull as "name:latest"; a bare name must still match.
+        installed = {"nomic-embed-text:latest": {}, "qwen3.5:4b": {}}
+        with patch.object(local, "installed_models", return_value=installed), \
+                patch.object(local, "capabilities", return_value=frozenset({"vision"})):
+            digests = local.check_runtime(local.LocalModels(planner="qwen3.5:4b", vision="qwen3.5:4b", verifier="qwen3.5:4b"))
+        self.assertIn("qwen3.5:4b", digests)
+        with patch.object(local, "installed_models", return_value={"qwen3.5:4b": {}}), \
+                patch.object(local, "capabilities", return_value=frozenset({"vision"})):
+            with self.assertRaises(RuntimeError) as error:
+                local.check_runtime(local.LocalModels())
+        self.assertIn("nomic-embed-text", str(error.exception))
+
+    def test_verification_windows_stay_short_enough_to_see_detail(self):
+        import inspect
+
+        from video_retrieval.verification import _video_windows, verify_candidate
+
+        window = inspect.signature(verify_candidate).parameters["verifier_window_seconds"].default
+        self.assertLessEqual(window, 30)
+        # A 60s candidate is split, so each call spends its frame budget on less time.
+        self.assertGreaterEqual(len(_video_windows(0, 60, window=window, overlap=5)), 3)
 
     def test_vision_prompt_uses_clip_relative_frames_and_speech(self):
         transcript = {"words": [], "segments": [

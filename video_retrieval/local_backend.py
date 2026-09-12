@@ -34,6 +34,8 @@ from .config import (
     FRAME_EMBEDDING_FPS,
     MODEL_CACHE_DIR,
     OLLAMA_URL,
+    TEXT_EMBEDDING_MODEL,
+    VISUAL_TILE_GRID,
     WHISPER_MODEL,
 )
 
@@ -50,8 +52,9 @@ class LocalModels:
     def index_signature(self):
         """Settings that change what a saved index contains (planner/verifier do not)."""
         return {
-            "version": 4,
-            "embedding": f"{CLIP_MODEL}@{FRAME_EMBEDDING_FPS:g}fps-mean",
+            "version": 5,
+            "embedding": f"{CLIP_MODEL}@{FRAME_EMBEDDING_FPS:g}fps-mean-{VISUAL_TILE_GRID}x{VISUAL_TILE_GRID}tiles",
+            "text_embedding": TEXT_EMBEDDING_MODEL,
             "transcription": f"faster-whisper-{WHISPER_MODEL}",
             "scene_model": self.vision,
             "frame_limit": self.frame_limit,
@@ -139,11 +142,23 @@ def capabilities(name):
         return frozenset()
 
 
+def installed_names(installed=None):
+    """Installed model names, plus the bare name for every ':latest' tag.
+
+    Ollama reports an untagged pull as "name:latest", so a bare name in settings
+    would otherwise look missing.
+    """
+    installed = installed_models() if installed is None else installed
+    names = set(installed)
+    names.update(name[: -len(":latest")] for name in installed if name.endswith(":latest"))
+    return names
+
+
 def check_runtime(models=None):
     models = models or current_models()
     installed = installed_models()
     roles = {"planner": models.planner, "vision": models.vision, "verifier": models.verifier}
-    missing = sorted({name for name in roles.values() if name not in installed})
+    missing = sorted({*roles.values(), TEXT_EMBEDDING_MODEL} - installed_names(installed))
     if missing:
         raise RuntimeError("Download missing Ollama models: " + ", ".join(f"ollama pull {name}" for name in missing))
     for role in ("vision", "verifier"):
@@ -295,6 +310,39 @@ def embed_text(text):
     return (vector / max(np.linalg.norm(vector), 1e-8)).astype(np.float32)
 
 
+# nomic-embed asks for a task prefix; other models take the text unchanged.
+_TASK_PREFIXES = {"document": "search_document: ", "query": "search_query: "}
+
+
+def _embed_text_model(text, task):
+    prefix = _TASK_PREFIXES[task] if TEXT_EMBEDDING_MODEL.startswith("nomic-embed") else ""
+    report(model=TEXT_EMBEDDING_MODEL, role="text_embedding")
+    try:
+        response = requests.post(OLLAMA_URL + "/api/embed",
+                                 json={"model": TEXT_EMBEDDING_MODEL, "input": prefix + str(text), "truncate": True},
+                                 timeout=300)
+    except requests.ConnectionError as exc:
+        raise RuntimeError(OLLAMA_DOWN) from exc
+    if response.status_code == 404:
+        raise RuntimeError(f"Ollama model {TEXT_EMBEDDING_MODEL} is not installed. Run: ollama pull {TEXT_EMBEDDING_MODEL}")
+    response.raise_for_status()
+    vectors = response.json().get("embeddings") or []
+    if not vectors:
+        raise RuntimeError(f"{TEXT_EMBEDDING_MODEL} returned no embedding.")
+    vector = np.asarray(vectors[0], dtype=np.float32)
+    return vector / max(np.linalg.norm(vector), 1e-8)
+
+
+def embed_document(text):
+    """Embed a scene description or transcript window for its index."""
+    return _embed_text_model(text, "document")
+
+
+def embed_query(text):
+    """Embed a search query for the scene and transcript indexes."""
+    return _embed_text_model(text, "query")
+
+
 def _file_key(path, *parts):
     path = Path(path).resolve()
     stat = path.stat()
@@ -302,9 +350,21 @@ def _file_key(path, *parts):
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
+def frame_views(frame, grid=VISUAL_TILE_GRID):
+    """The whole frame followed by its grid x grid tiles."""
+    views = [frame]
+    height, width = frame.shape[:2]
+    for row in range(grid):
+        for col in range(grid):
+            views.append(frame[row * height // grid:(row + 1) * height // grid,
+                               col * width // grid:(col + 1) * width // grid])
+    return views
+
+
 def frame_embeddings(video_path, fps=FRAME_EMBEDDING_FPS):
-    """CLIP embeddings for every frame sampled at `fps`, computed once per file."""
-    return _frame_embeddings(str(Path(video_path).resolve()), _file_key(video_path, CLIP_MODEL, fps), float(fps))
+    """CLIP embeddings for each frame sampled at `fps`, shaped (frames, views, dim)."""
+    key = _file_key(video_path, CLIP_MODEL, fps, VISUAL_TILE_GRID)
+    return _frame_embeddings(str(Path(video_path).resolve()), key, float(fps))
 
 
 @lru_cache(maxsize=4)
@@ -318,8 +378,8 @@ def _frame_embeddings(path, key, fps):
     info = probe_video(path)
     if not info["width"] or not info["height"]:
         raise ValueError(f"No video stream in {path}")
-    # CLIP crops a 224px square from the short side; decoding at that size keeps the pipe small.
-    scale = 224 / min(info["width"], info["height"])
+    # Decode large enough that every tile still has a full 224px short side.
+    scale = 224 * VISUAL_TILE_GRID / min(info["width"], info["height"])
     width = max(2, round(info["width"] * scale / 2) * 2)
     height = max(2, round(info["height"] * scale / 2) * 2)
     frame_bytes = width * height * 3
@@ -336,11 +396,11 @@ def _frame_embeddings(path, key, fps):
             if len(data) < frame_bytes:
                 break
             batch.append(np.frombuffer(data, np.uint8).reshape(height, width, 3))
-            if len(batch) == 32:
-                vectors.append(encode(images=batch))
+            if len(batch) == 8:
+                vectors.append(_encode_frame_views(batch))
                 batch = []
         if batch:
-            vectors.append(encode(images=batch))
+            vectors.append(_encode_frame_views(batch))
         if process.wait() != 0 and not vectors:
             raise RuntimeError(f"FFmpeg could not decode {path}")
     finally:
@@ -358,15 +418,23 @@ def _frame_embeddings(path, key, fps):
     return times, vectors
 
 
+def _encode_frame_views(frames):
+    """Embed each frame's whole-image and tile views: (frames, views, dim)."""
+    views = [view for frame in frames for view in frame_views(frame)]
+    features = encode(images=views)
+    return features.reshape(len(frames), -1, features.shape[-1])
+
+
 def embed_video_interval(video_path, start, end):
-    """Mean CLIP embedding of the cached frames inside [start, end)."""
+    """Mean embedding per view over the cached frames inside [start, end): (views, dim)."""
     times, vectors = frame_embeddings(video_path)
     inside = (times >= float(start)) & (times < float(end))
     if inside.any():
-        vector = vectors[inside].mean(axis=0)
+        views = vectors[inside].mean(axis=0)
     else:
-        vector = vectors[int(np.argmin(np.abs(times - (float(start) + float(end)) / 2)))]
-    return (vector / max(np.linalg.norm(vector), 1e-8)).astype(np.float32)
+        views = vectors[int(np.argmin(np.abs(times - (float(start) + float(end)) / 2)))]
+    views = np.atleast_2d(views)
+    return (views / np.clip(np.linalg.norm(views, axis=-1, keepdims=True), 1e-8, None)).astype(np.float32)
 
 
 # ------------------------------------------------------------------ Whisper

@@ -16,6 +16,14 @@ def embed_text(text):
 def embed_video_interval(video_path, start, end):
     return local_backend.embed_video_interval(video_path, start, end)
 
+#Embed a scene description or transcript window with the dedicated text model.
+def embed_document(text):
+    return local_backend.embed_document(text)
+
+#Embed a query for the scene and transcript indexes.
+def embed_query(text):
+    return local_backend.embed_query(text)
+
 
 #Return an L2-normalized float32 vector.
 def normalize_embedding(x):
@@ -235,7 +243,8 @@ def embed_scale(
             f"No {scale!r} chunks were successfully embedded."
         )
 
-    embeddings = np.vstack(embeddings).astype(np.float32)
+    # (chunks, views, dim): each chunk keeps a vector per whole-frame and tile view.
+    embeddings = np.stack(embeddings).astype(np.float32)
 
     np.save(
         save_dir / f"{scale}_embeddings.npy",
@@ -266,6 +275,11 @@ def build_faiss_index(
         embeddings,
         dtype=np.float32,
     ).copy()
+
+    # Per-scale FAISS files stay single-vector; they index the whole-frame view.
+    # ascontiguousarray matters: a [:, 0] slice is strided, and FAISS rejects that.
+    if vectors.ndim == 3:
+        vectors = np.ascontiguousarray(vectors[:, 0])
 
     if vectors.ndim != 2:
         raise ValueError(
@@ -329,9 +343,13 @@ class HierarchicalVideoIndex:
         for scale, vectors in embeddings_by_scale.items():
             vectors = np.asarray(vectors, dtype=np.float32).copy()
 
-            if vectors.ndim != 2:
+            # (chunks, dim) for a single view, or (chunks, views, dim) with tiling.
+            if vectors.ndim == 2:
+                vectors = vectors[:, None, :]
+
+            if vectors.ndim != 3:
                 raise ValueError(
-                    f"{scale}: expected 2-D embeddings, got {vectors.shape}."
+                    f"{scale}: expected 2-D or 3-D embeddings, got {vectors.shape}."
                 )
 
             rows = [dict(x) for x in metadata_by_scale[scale]]
@@ -341,12 +359,12 @@ class HierarchicalVideoIndex:
                     f"{scale}: {len(vectors)} vectors but {len(rows)} metadata rows."
                 )
 
-            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+            norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
             vectors = vectors / np.clip(norms, 1e-12, None)
 
             if expected_dim is None:
-                expected_dim = vectors.shape[1]
-            elif vectors.shape[1] != expected_dim:
+                expected_dim = vectors.shape[-1]
+            elif vectors.shape[-1] != expected_dim:
                 raise ValueError(
                     "All scales must use the same embedding dimension."
                 )
@@ -370,6 +388,11 @@ class HierarchicalVideoIndex:
 
         self.ntotal = len(self.output_metadata)
         self.d = int(expected_dim or 0)
+
+    #Score each chunk by its best-matching view, so a tile can match on its own
+    @staticmethod
+    def _view_scores(vectors, query):
+        return (vectors @ query).max(axis=-1)
 
     #Returns the indexes of the top scoring candidates
     def _top_indices(
@@ -426,7 +449,7 @@ class HierarchicalVideoIndex:
 
         first_scale = self.scale_order[0]
         first_vectors = self.embeddings_by_scale[first_scale]
-        first_scores = first_vectors @ query
+        first_scores = self._view_scores(first_vectors, query)
 
         selected_indices = self._top_indices(
             first_scores,
@@ -463,7 +486,7 @@ class HierarchicalVideoIndex:
 
             child_records = self.metadata_by_scale[scale]
             child_vectors = self.embeddings_by_scale[scale]
-            direct_scores = child_vectors @ query
+            direct_scores = self._view_scores(child_vectors, query)
 
             eligible = []
             context_scores: Dict[int, float] = {}

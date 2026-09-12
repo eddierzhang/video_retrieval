@@ -34,23 +34,33 @@ Choose exactly one executor:
    interfaces, documents, whiteboards, signs and storefronts, product packaging
    and labels, serial or model numbers, license plates, sports jerseys, name
    badges, road markings, timestamps burned into the video, and any other
-   text-bearing object or region.
+   text-bearing object or region. Route here only when those characters are
+   themselves the answer; text that merely appears in the scene does not count.
 
-CRITICAL ROUTING RULES AND EXAMPLES:
-- The user must NOT need to say "OCR". Infer visual text extraction from intent.
-- "what does the slide say" -> visual_text_extraction.
+CRITICAL ROUTING RULE - decide by the ANSWER the user wants, never by whether
+text happens to be on screen:
+- If the answer is a STRING OF CHARACTERS to read back, use visual_text_extraction.
+- If the answer is a MOMENT - a time, an event, a clip - use temporal_grounding,
+  even when the frame is full of writing. Screens, code editors, slides, menus,
+  documents and signs are ordinary scenery when the request is about an action.
+
+EXAMPLES, including pairs that differ only in what is being asked:
 - "read the file name shown in the editor tab" -> visual_text_extraction.
+- "scrolling through code in an editor" -> temporal_grounding: the answer is when
+  the scrolling happens, and the code on screen is incidental.
+- "what does the slide say" -> visual_text_extraction.
+- "when does she change slides" -> temporal_grounding.
 - "identify all license plate numbers" -> visual_text_extraction.
+- "find a red car" -> temporal_grounding.
+- "model airplanes in a display case" -> temporal_grounding: these are objects to
+  find, and nothing has to be read.
 - "what is the price on the menu board" -> visual_text_extraction.
 - "find the player wearing number 10" -> visual_text_extraction, because the
-  printed number is what decides the match.
-- "find a red car" -> temporal_grounding, because nothing has to be read.
+  printed number decides the match.
 - "when does she say thank you" -> temporal_grounding, because the words are
   spoken rather than printed in the frame.
-- "when does an error message appear" -> visual_text_extraction if the wording
-  must be reported back, temporal_grounding if any error dialog counts.
-- If visible text is incidental and not needed to answer, use
-  temporal_grounding.
+- The user must NOT need to say "OCR". Infer it from the answer they want.
+- If visible text is incidental and not needed to answer, use temporal_grounding.
 
 For visual_text_extraction, decompose the request into FOUR semantic fields:
 

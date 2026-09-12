@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .embeddings import embed_text, normalize_embedding
+from .embeddings import embed_document, embed_query, normalize_embedding
 
 
 #Transcribe the whole video once with local Whisper and save absolute word/segment timestamps
@@ -119,9 +119,7 @@ def embed_transcript_windows(
 
             try:
 
-                vector = embed_text(
-                    window["text"]
-                )
+                vector = embed_document(window["text"])
 
                 vector = (
                     normalize_embedding(
@@ -260,7 +258,7 @@ def search_transcript_semantic(
 
     query_embedding = (
         normalize_embedding(
-            embed_text(query)
+            embed_query(query)
         )
     )
 

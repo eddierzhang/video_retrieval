@@ -23,8 +23,9 @@ python -m venv .venv
 .\start.ps1
 ```
 
-`start.ps1` starts the Ollama server if it isn't already running, downloads the default
-model on first run (`qwen3.5:4b`, about 3.4 GB), and opens <http://127.0.0.1:8765>.
+`start.ps1` starts the Ollama server if it isn't already running, downloads the two models it
+needs on first run (`qwen3.5:4b` and `nomic-embed-text`, about 3.7 GB together), and opens
+<http://127.0.0.1:8765>.
 
 The first search also downloads CLIP and Whisper weights (about 1 GB) into `local_data/models/`.
 After that the whole system works offline.
@@ -53,15 +54,17 @@ count needs a re-index, and the app tells you so.
 
 | Step | Time |
 | --- | --- |
-| Indexing a 21 s clip (first run, includes loading CLIP) | 30 s |
-| Verified search (1 candidate region → 5 occurrences → 1 confirmed) | 56 s |
-| Quick search | 13 s |
-| Text-reading search (“what file name is in the editor tab?”) | 24 s |
+| Indexing a 21 s clip (first run, includes loading CLIP) | 51 s |
+| Indexing a 104 s clip with speech | 51 s |
+| Verified search | 56 s |
+| Quick search | 14 s |
+| Text-reading search ("what file name is in the editor tab?") | 28 s |
 
-Indexing cost is dominated by scene descriptions: roughly one vision call per 30 s of video
-(about 7 s each here), plus one pass of CLIP frame embeddings and one Whisper pass.
+Indexing cost is dominated by scene descriptions - roughly one vision call per 30 s of video,
+about 7 s each here - plus one pass of CLIP frame embeddings (five views per frame, so five
+times the embedding work that a single whole-frame pass would cost) and one Whisper pass.
 Search cost is dominated by the vision calls in verification, so it grows with the number of
-candidates you allow, not with the length of the video.
+candidates you allow and how finely each one is split, not with the length of the video.
 
 ## What runs locally
 
@@ -70,7 +73,8 @@ candidates you allow, not with the length of the video.
 | Query planner | `qwen3.5:4b` via Ollama |
 | Scene descriptions, first verification pass, boundary refinement, OCR | `qwen3.5:4b` (vision) |
 | Second, stricter verification pass | `qwen3.5:4b` (configurable separately) |
-| Video and text embeddings | CLIP `openai/clip-vit-base-patch32`, mean-pooled over frames |
+| Frame embeddings | CLIP `openai/clip-vit-base-patch32`, whole frame plus 2x2 tiles |
+| Scene and transcript embeddings | `nomic-embed-text` via Ollama |
 | Speech transcription | faster-whisper `base`, with word timestamps |
 
 One multimodal model fills every role by default, so the GPU never swaps models mid-search.
@@ -107,20 +111,25 @@ The video is divided at several temporal scales. Large chunks preserve the conte
 recognize an event; small chunks localize it. Retrieval moves from coarse to fine.
 
 ### 2. Video embeddings
-Frames are sampled once per second and embedded with CLIP; a chunk's embedding is the normalized
-mean of the frames inside it, at every scale. Because each frame is embedded once and reused,
-adding scales costs almost nothing. A FAISS inner-product index over normalized vectors gives
-cosine similarity against the text query.
+Frames are sampled once per second and embedded with CLIP. Each frame is embedded twice over: once
+whole, and once per tile of a 2x2 grid. CLIP resizes whatever it is given to 224 px, so a detail
+occupying a tenth of a 4K frame is a handful of pixels by the time the model sees it; the tiles
+give that detail a view of its own. A chunk keeps one vector per view, mean-pooled over its frames,
+and scores against a query by its **best-matching view**, so a match in one corner is not averaged
+away by three quiet ones. Each frame is still embedded only once and reused across all scales.
 
 ### 3. Transcript retrieval
 Audio is transcribed once with word-level timestamps and split into overlapping windows. Both
 semantic (embedding) and BM25 (lexical) search run over it: embeddings catch paraphrase, BM25
-catches exact names and phrases.
+catches exact names and phrases. The semantic side uses a dedicated text embedder rather than
+CLIP, whose text tower is capped at 77 tokens and trained on image captions - a poor fit for
+sentences of speech.
 
 ### 4. Visual metadata
 Each medium chunk is described by the vision model as structured JSON (actions, people, objects,
-state changes, visible text, search terms). These descriptions are embedded and indexed, giving a
-second, independent visual channel that does not depend on the raw embedding.
+state changes, visible text, search terms). These descriptions are embedded with the same text
+embedder as the transcript and indexed separately, giving a second, independent visual channel
+that does not depend on the raw frame embedding.
 
 ### 5. OCR / visual text
 When answering needs text that is visible on screen, a separate executor scans the video, then
@@ -149,7 +158,9 @@ across the whole video.
 
 ### 10. Verification
 The highest-ranking candidates are inspected by the vision model, which finds every distinct
-occurrence inside a region; a second, stricter pass then re-checks each proposed occurrence and
+occurrence inside a region. A vision call spends a fixed frame budget on whatever span it is
+handed, so candidates are split into short windows: at 12 frames, a 75-second window is one frame
+every six seconds, while a 25-second window is one every two. a second, stricter pass then re-checks each proposed occurrence and
 rejects near misses. Boundaries are refined by asking progressively shorter clips where the
 transition happens, and overlapping detections are removed by temporal NMS that preserves
 genuinely distinct actors.

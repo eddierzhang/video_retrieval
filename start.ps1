@@ -34,12 +34,17 @@ if (-not (Test-Ollama)) {
     if (-not (Test-Ollama)) { throw "Ollama did not start. See $log.err" }
 }
 
-# First run: download the default multimodal model (about 3.4 GB).
-$defaultModel = 'qwen3.5:4b'
+# First run: download the models the pipeline needs (about 3.7 GB in total).
+$required = [ordered]@{
+    'qwen3.5:4b'        = 'planning, scene descriptions, and verification'
+    'nomic-embed-text'  = 'scene and transcript search'
+}
 $installed = (Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags').models.name
-if ($installed -notcontains $defaultModel) {
-    Write-Host "Downloading $defaultModel for planning, scene descriptions, and verification..."
-    & $runtime pull $defaultModel
+foreach ($model in $required.Keys) {
+    if ($installed -notcontains $model) {
+        Write-Host "Downloading $model for $($required[$model])..."
+        & $runtime pull $model
+    }
 }
 
 $appArgs = @('-m', 'webapp', '--port', $Port)

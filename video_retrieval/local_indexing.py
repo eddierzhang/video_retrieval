@@ -15,6 +15,10 @@ INDEX_STAGES = [
 ]
 
 
+class IndexVersionMismatch(RuntimeError):
+    """Raised when a saved index predates a change to how vectors are built."""
+
+
 def index_key(source, models):
     source = Path(source).resolve()
     signature = {**models.index_signature(), "source_size": source.stat().st_size, "source_modified": source.stat().st_mtime_ns}
@@ -94,6 +98,12 @@ def load_index(folder, models=None, source=None):
 
     folder = Path(folder)
     saved = json.loads((folder / "ready.json").read_text(encoding="utf-8"))
+    current = (models or LocalModels()).index_signature()
+    if (saved.get("models") or {}).get("version") != current["version"]:
+        raise IndexVersionMismatch(
+            "This index was built by an earlier version of the pipeline, and its vectors are "
+            "no longer compatible. Re-index this video to search it."
+        )
     manifest = json.loads((folder / "chunks" / "manifest.json").read_text(encoding="utf-8"))
     if source is not None:
         manifest["video"]["path"] = str(Path(source).resolve())

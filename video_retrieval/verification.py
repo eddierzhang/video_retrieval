@@ -191,8 +191,10 @@ def verify_candidate(
     query,
     plan=None,
     role="vision",
-    verifier_window_seconds=75.0,
-    verifier_overlap_seconds=12.0,
+    # A short window matters: the model sees frame_limit frames of whatever span it
+    # is given, so 75s at 12 frames was one frame per 6 seconds.
+    verifier_window_seconds=25.0,
+    verifier_overlap_seconds=5.0,
     min_confidence=0.25,
 ):
 
