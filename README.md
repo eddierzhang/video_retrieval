@@ -230,6 +230,39 @@ its time. The 4B vision model is the teacher; nothing is labeled by hand.
 The filter always keeps the strongest candidates whatever it believes, so a badly fitted model can
 cost time but can never empty the candidate list.
 
+### Candidate ranking, and knowing how many to verify
+
+The pre-filter above asks "is this candidate good?" one candidate at a time. Nothing consumes
+that answer one candidate at a time - verification walks the list from the top, so what matters
+is the **order**, and ordering is what a ranking loss optimises directly.
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.rank --dry-run   # what has been collected
+.\.venv\Scripts\python.exe -m bench.rank             # train every loss, keep the best
+```
+
+Three losses over the same small network, so the comparison is an ablation rather than a claim:
+**pointwise** binary cross-entropy per candidate (what `bench.distill` does), **pairwise**
+RankNet over positive/negative pairs weighted by the NDCG each swap would change (LambdaRank),
+and **listwise** softmax cross-entropy over a whole search (ListNet). All three are scored
+against the ordering retrieval already produces, and nothing is saved unless it beats that.
+
+Then **split conformal prediction** answers the expensive question: how many candidates deserve
+a vision call? On held-out searches it calibrates a score threshold such that the set it keeps
+contains a confirmed candidate at least `1 - alpha` of the time - 90% by default, `--alpha` to
+trade coverage for speed. The guarantee is about coverage across searches, not about any single
+candidate being right, and it holds without the probabilities being well calibrated. It needs
+three disjoint splits, whole searches on one side of each line:
+
+```
+fit         train the ranker
+calibrate   measure how badly the best confirmed candidate tends to score
+test        check the coverage actually delivered, and what it cost
+```
+
+The floor from the pre-filter still applies: whatever the model believes, the strongest few
+candidates are always verified, so a badly fitted ranker can cost time but cannot empty the list.
+
 ### Query adapter, self-supervised from your own videos
 
 Each indexed chunk hands over free training pairs: the text the vision model wrote about a stretch
@@ -281,8 +314,8 @@ against `bench.run` before trusting it.
 | `video_retrieval/local_indexing.py` | Builds or loads a video's indexes |
 | `video_retrieval/pipeline.py` | `RetrievalResources` and `VideoRetrievalPipeline` |
 | `webapp/` | Local web app: Starlette API, job queue, library on disk, and the UI in `webapp/static/` |
-| `video_retrieval/learning.py` | The optional learned pieces: candidate pre-filter and query adapter |
-| `bench/` | Labeled and synthetic pairs, the accuracy runner, and the two trainers |
+| `video_retrieval/learning.py` | The optional learned pieces: candidate pre-filter, ranker with its conformal set, and query adapter |
+| `bench/` | Labeled and synthetic pairs, the accuracy runner, and the trainers: `distill`, `rank`, `adapt` |
 | `model_completed.ipynb` | Notebook walkthrough of the same pipeline |
 
 ### Where data lives

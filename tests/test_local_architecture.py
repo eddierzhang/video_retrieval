@@ -230,6 +230,89 @@ class LocalArchitectureTest(unittest.TestCase):
         self.assertAlmostEqual(learning.candidate_features(candidates[1], 1, candidates, evidence, {}, 40)["channel_negative"], 0.3)
         self.assertEqual(len(learning.vectorize(features)), len(learning.FEATURE_NAMES))
 
+    def test_ranker_forward_matches_a_hand_built_network(self):
+        from video_retrieval import learning
+
+        first = np.zeros((len(learning.FEATURE_NAMES), 2))
+        first[learning.FEATURE_NAMES.index("score"), 0] = 1.0
+        first[learning.FEATURE_NAMES.index("channel_video"), 1] = 1.0
+        model = {"mean": [0.0] * len(learning.FEATURE_NAMES), "std": [1.0] * len(learning.FEATURE_NAMES),
+                 "layers": [{"w": first.tolist(), "b": [0.0, 0.0]},
+                            {"w": [[1.0], [2.0]], "b": [0.5]}],
+                 "platt": {"a": 1.0, "b": 0.0}}
+        features = {name: 0.0 for name in learning.FEATURE_NAMES}
+        features.update({"score": 0.8, "channel_video": 0.3})
+        matrix = np.stack([learning.vectorize(features)])
+        # relu(0.8) * 1 + relu(0.3) * 2 + 0.5
+        self.assertAlmostEqual(float(learning.ranker_scores(model, matrix)[0]), 1.9, places=6)
+        # A negative feature is clipped by the relu, not passed through.
+        features["score"] = -5.0
+        clipped = learning.ranker_scores(model, np.stack([learning.vectorize(features)]))
+        self.assertAlmostEqual(float(clipped[0]), 1.1, places=6)
+
+    def test_conformal_threshold_reaches_its_coverage_target(self):
+        from bench.rank import calibrate_conformal, evaluate_sets
+
+        # Twenty searches; the best confirmed candidate scores anywhere from 0.05 to 1.0.
+        best = np.linspace(0.05, 1.0, 20)
+        groups = []
+        for value in best:
+            groups.append({"labels": np.array([1.0, 0.0, 0.0, 0.0]),
+                           "probabilities": np.array([value, 0.02, 0.01, 0.0])})
+        probability_of = lambda group: group["probabilities"]
+        conformal = calibrate_conformal(groups, probability_of, alpha=0.1)
+        self.assertEqual(conformal["calibration_searches"], 20)
+        # 90% coverage must keep all but the strongest-scoring couple of cuts.
+        self.assertLessEqual(conformal["threshold"], float(np.quantile(best, 0.1)))
+        measured = evaluate_sets(groups, probability_of, conformal["threshold"])
+        self.assertGreaterEqual(measured["coverage"], 0.9)
+        # A tighter alpha can only lower the bar, never raise it.
+        loose = calibrate_conformal(groups, probability_of, alpha=0.5)
+        self.assertGreaterEqual(loose["threshold"], conformal["threshold"])
+        # Searches with nothing to find carry no information about coverage.
+        empty = [{"labels": np.zeros(3), "probabilities": np.ones(3)}]
+        self.assertIsNone(calibrate_conformal(empty, probability_of, alpha=0.1))
+
+    def test_selection_reorders_but_never_empties_the_list(self):
+        from video_retrieval import learning
+
+        candidates = [{"candidate_id": i, "start": i * 10, "end": i * 10 + 8, "score": 1.0 - i * 0.1}
+                      for i in range(8)]
+        weights = np.zeros((len(learning.FEATURE_NAMES), 1))
+        weights[learning.FEATURE_NAMES.index("score"), 0] = -1.0  # deliberately inverts the order
+        model = {"mean": [0.0] * len(learning.FEATURE_NAMES), "std": [1.0] * len(learning.FEATURE_NAMES),
+                 "layers": [{"w": weights.tolist(), "b": [0.0]}],
+                 "platt": {"a": 1.0, "b": 0.0},
+                 "conformal": {"threshold": 0.99, "coverage": 0.9}}
+        with patch.object(learning, "load_ranker", return_value=model):
+            kept, info = learning.select_candidates(candidates, [], {}, 100, keep_min=3)
+        self.assertEqual(len(kept), 3)          # the threshold rejects everything; the floor holds
+        self.assertEqual(info["before"], 8)
+        self.assertEqual(kept[0]["candidate_id"], 7)  # the inverted ranking really is applied
+        self.assertIn("ranker_probability", kept[0])
+        with patch.object(learning, "load_ranker", return_value=None), \
+             patch.object(learning, "load_prefilter", return_value=None):
+            untouched, absent = learning.select_candidates(candidates, [], {}, 100)
+        self.assertIs(untouched, candidates)
+        self.assertIsNone(absent)
+
+    def test_ranking_rows_group_by_search_and_split_whole(self):
+        from bench.rank import group_searches, split_searches
+
+        rows = []
+        for search in range(12):
+            for index in range(4):
+                rows.append({"search": f"s{search}", "query": "same text for every search",
+                             "at": 1000.0, "label": int(index == 0),
+                             "features": {name: 0.1 for name in ["score", "channel_video"]}})
+        groups = group_searches(rows)
+        self.assertEqual(len(groups), 12)  # grouped by id, not by the identical query text
+        self.assertEqual(len(groups[0]["labels"]), 4)
+        fit, calibration, test = split_searches(groups)
+        names = [{group["search"] for group in part} for part in (fit, calibration, test)]
+        self.assertEqual(sum(len(part) for part in names), 12)
+        self.assertFalse(names[0] & names[1] or names[1] & names[2] or names[0] & names[2])
+
     def test_adapter_split_keeps_every_text_of_a_span_together(self):
         from bench.adapt import split_groups
 

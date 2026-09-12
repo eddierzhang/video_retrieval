@@ -242,13 +242,14 @@ def retrieve_video(
     }
 
     if run_verification:
-        # A trained pre-filter, when one exists, drops candidates the vision model
-        # would reject. Until then this returns the candidates untouched.
-        candidates, prefilter = learning.prefilter_candidates(
+        # A trained ranker reorders the candidates and keeps a conformal prediction set;
+        # without one this falls back to the pointwise pre-filter, and then to doing
+        # nothing at all. The candidates that survive are what the vision model sees.
+        candidates, selection = learning.select_candidates(
             candidates, evidence_map, plan, manifest["video"]["duration"]
         )
-        if prefilter:
-            diagnostics["prefilter"] = prefilter
+        if selection:
+            diagnostics["prefilter"] = selection
 
         # 6. First vision-model pass finds every occurrence inside each candidate
         local_backend.stage("Verifying candidates with the vision model")

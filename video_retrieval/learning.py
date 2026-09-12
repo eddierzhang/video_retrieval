@@ -17,6 +17,7 @@ from functools import lru_cache
 import json
 from pathlib import Path
 import time
+import uuid
 
 import numpy as np
 
@@ -25,6 +26,7 @@ from .config import DATA_DIR
 LEARNING_DIR = DATA_DIR / "learning"
 CANDIDATE_EXAMPLES = LEARNING_DIR / "candidates.jsonl"
 PREFILTER_MODEL = LEARNING_DIR / "candidate_prefilter.json"
+RANKER_MODEL = LEARNING_DIR / "candidate_ranker.json"
 ADAPTER_MODEL = LEARNING_DIR / "query_adapter.npz"
 
 FEATURE_NAMES = (
@@ -80,16 +82,24 @@ def vectorize(features):
 # ------------------------------------------------------------ collecting
 
 def log_candidates(candidates, evidence_map, plan, video_duration, query, survivors):
-    """Record which candidates actually yielded a confirmed match, for later training."""
+    """Record which candidates actually yielded a confirmed match, for later training.
+
+    Every row of one search shares a `search` id, because ranking is a per-search problem:
+    a listwise loss needs to know which candidates competed against each other, and the
+    train/holdout split has to keep a whole search on one side.
+    """
     if not candidates:
         return
     survivors = {int(x) for x in survivors if x is not None}
+    search = uuid.uuid4().hex[:12]
+    at = time.time()
     LEARNING_DIR.mkdir(parents=True, exist_ok=True)
     with open(CANDIDATE_EXAMPLES, "a", encoding="utf-8") as file:
         for rank, candidate in enumerate(candidates):
             features = candidate_features(candidate, rank, candidates, evidence_map, plan, video_duration)
             file.write(json.dumps({
-                "at": time.time(),
+                "at": at,
+                "search": search,
                 "query": query,
                 "executor": (plan or {}).get("executor"),
                 "label": int(candidate.get("candidate_id") in survivors),
@@ -162,6 +172,89 @@ def prefilter_candidates(candidates, evidence_map, plan, video_duration, keep_mi
         "before": len(candidates),
         "after": len(kept),
         "skipped": len(candidates) - len(kept),
+    }
+
+
+# ------------------------------------------------- ranker and conformal set
+
+def load_ranker():
+    """The trained candidate ranker, or None when it has not been trained."""
+    path = Path(RANKER_MODEL)
+    if not path.is_file():
+        return None
+    try:
+        return _load_json_model(str(path), path.stat().st_mtime_ns)
+    except (OSError, ValueError):
+        return None
+
+
+def ranker_scores(model, matrix):
+    """Forward pass of the small ranking network, in numpy so search needs no torch."""
+    mean = np.asarray(model["mean"], dtype=np.float64)
+    std = np.asarray(model["std"], dtype=np.float64)
+    values = (np.asarray(matrix, dtype=np.float64) - mean) / np.where(std > 0, std, 1.0)
+    layers = model["layers"]
+    for index, layer in enumerate(layers):
+        values = values @ np.asarray(layer["w"], dtype=np.float64) + np.asarray(layer["b"], dtype=np.float64)
+        if index < len(layers) - 1:
+            values = np.maximum(values, 0.0)
+    return values[:, 0]
+
+
+def ranker_probabilities(model, scores):
+    """Platt-scaled scores. Conformal validity does not depend on these being calibrated."""
+    platt = model.get("platt") or {}
+    a = float(platt.get("a", 1.0))
+    b = float(platt.get("b", 0.0))
+    return 1.0 / (1.0 + np.exp(-(a * np.asarray(scores, dtype=np.float64) + b)))
+
+
+def select_candidates(candidates, evidence_map, plan, video_duration, keep_min=3):
+    """Order candidates by the learned ranker and keep a conformal prediction set.
+
+    The threshold comes from split conformal calibration: on held-out searches, the set it
+    produces contained a confirmed candidate at least `1 - alpha` of the time. That is a
+    statement about coverage across searches, not about any single candidate being right.
+
+    Falls back to the pointwise pre-filter, and then to doing nothing at all, so an untrained
+    system behaves exactly as it did before.
+    """
+    model = load_ranker()
+    if not model:
+        return prefilter_candidates(candidates, evidence_map, plan, video_duration)
+    if len(candidates) <= keep_min:
+        return candidates, None
+
+    matrix = np.stack([
+        vectorize(candidate_features(candidate, rank, candidates, evidence_map, plan, video_duration))
+        for rank, candidate in enumerate(candidates)
+    ])
+    scores = ranker_scores(model, matrix)
+    probabilities = ranker_probabilities(model, scores)
+    conformal = model.get("conformal") or {}
+    threshold = float(conformal.get("threshold", 0.0))
+
+    order = list(np.argsort(-scores))
+    kept = [index for index in order if probabilities[index] >= threshold]
+    if len(kept) < keep_min:
+        kept = order[:keep_min]  # the floor: a bad model can cost time, never empty the list
+    selected = []
+    for position, index in enumerate(kept):
+        candidate = dict(candidates[index])
+        candidate["ranker_score"] = float(scores[index])
+        candidate["ranker_probability"] = float(probabilities[index])
+        candidate["ranker_position"] = position
+        selected.append(candidate)
+    return selected, {
+        "model": "ranker",
+        "model_trained_at": model.get("trained_at"),
+        "loss": model.get("loss"),
+        "threshold": threshold,
+        "coverage_target": conformal.get("coverage"),
+        "before": len(candidates),
+        "after": len(selected),
+        "skipped": len(candidates) - len(selected),
+        "reordered": [int(index) for index in kept] != sorted(int(index) for index in kept),
     }
 
 
