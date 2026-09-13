@@ -259,21 +259,40 @@ same `locate_candidates`, NMS and learned boundaries a quick search runs - so a 
 takes half a second. A test, and a live check on real rows, confirm the replay returns exactly what
 the pipeline does.
 
-Cross-validated by timeline over 59 rows from 10 timelines, 300 trials per fold:
+The first tuning used only whole 30-second events, and it looked good on them: held-out top-1 IoU
+0.406 to 0.523, better in 5 of 5 folds. The obvious worry was that it had fitted that length, so
+`bench.construct --event-seconds 4 20` built a second set of 4-20 second slices, each with a query
+the vision model wrote for that slice, and the saved settings were scored on it without searching:
 
-| | Held-out top-1 IoU | Folds improved |
-| --- | --- | --- |
-| Hand-picked defaults | 0.406 | |
-| **Tuned** | **0.523** | **5 of 5** |
+| Event length | Rows | Defaults | Tuned on 30 s events |
+| --- | --- | --- | --- |
+| under 8 s | 11 | 0.151 | 0.376 |
+| 8-15 s | 19 | 0.190 | **0.093** |
+| 15-25 s | 24 | 0.370 | 0.428 |
+
+Better on average, and much worse for 8-15 second events - which the average hid. So a tuned set is
+now saved only if it also loses no more than 0.05 IoU in any event-length bucket, and the settings
+were re-tuned on both sets together - 113 rows from 18 timelines, cross-validated by timeline:
+
+| Event length | Held-out rows | Defaults | Tuned |
+| --- | --- | --- | --- |
+| under 8 s | 11 | 0.151 | 0.260 |
+| 8-15 s | 19 | 0.190 | 0.187 |
+| 15-25 s | 31 | 0.420 | 0.517 |
+| 25 s and over | 52 | 0.381 | 0.507 |
+| **all** | 113 | **0.337** | **0.432** (better in 5 of 5 folds) |
 
 The saved settings (`local_data/learning/retrieval_settings.json`) apply only to quick searches;
-delete the file to go back. The biggest moves were less padding around candidates (10 s to 2.7 s), a
-shallower recursive search, and window scores that favour sustained evidence over a single peak.
+delete the file to go back. The search turned recursive refinement off, cut candidate padding from
+10 s to 3.9 s and the gap that joins evidence from 10 s to 2.2 s, and raised the floor a region must
+clear to become a candidate. With recursion off, the window-score weights and most recursive
+settings in the file no longer do anything - read no meaning into their values.
 
-Read the gain with two caveats. Every constructed event is a whole 30-second chunk, so settings that
-favour broad, sustained evidence may be tuned to that length rather than to events in general. And
-timelines draw from the same pool of source chunks, so a held-out timeline can contain footage a fit
-timeline also used - folds keep timelines apart, not source footage.
+Two caveats remain. Short-event queries are still worded by the vision model, and 10 rows whose
+query nearly repeats another in the same timeline are left out, since no setting can tell those
+apart. And timelines draw from the same small pool of source footage - 23 of its 33 chunks are one
+tennis video - so folds keep timelines apart but not footage, and the held-out numbers are probably
+somewhat optimistic.
 
 ### Every run is recorded
 
