@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moments"
+version = "1.0.0"
+description = "Natural-language video retrieval that runs entirely on local models"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Eddie Zhang" }]
+keywords = ["video retrieval", "temporal grounding", "multimodal", "local models", "conformal prediction"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Kept in step with requirements.txt, which start.ps1 installs. For NVIDIA GPU acceleration,
+# install the CUDA build of PyTorch first (see the README).
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "pillow",
+    "requests",
+    "tqdm",
+    "jsonschema",
+    "faiss-cpu",
+    "rank-bm25",
+    "av",
+    "torch>=2.6",
+    "transformers>=4.50,<5",
+    "faster-whisper>=1.1,<2",
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+    "python-multipart",
+    "nbformat",
+]
+
+[project.optional-dependencies]
+dev = ["httpx", "pyflakes"]
+
+[project.scripts]
+moments = "moments.cli:main"
+
+[project.urls]
+Repository = "https://github.com/eddierzhang/video_retrieval"
+
+[tool.setuptools.packages.find]
+include = ["moments*", "video_retrieval*", "webapp*", "bench*"]
+
+[tool.setuptools.package-data]
+webapp = ["static/*"]
+bench = ["dataset.json", "routing.json", "synthetic.json"]

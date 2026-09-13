@@ -29,3 +29,8 @@ transcript_index/
 *.stackdump
 bench/runs/
 bench/constructed*.json
+
+# packaging
+*.egg-info/
+build/
+dist/
