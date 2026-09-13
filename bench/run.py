@@ -84,6 +84,8 @@ def run_row(pipeline, row, output_root):
         "elapsed": round(time.time() - started, 1),
         "executor": (result.get("plan") or {}).get("executor"),
         "num_matches": len(matches),
+        # The intervals themselves, so bench.boundaries can learn from the proposals retrieval made.
+        "matches": [[round(float(m["start"]), 3), round(float(m["end"]), 3)] for m in matches[:5]],
     }
     expect = row["expect"]
     if "text" in expect:

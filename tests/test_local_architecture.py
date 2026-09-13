@@ -297,6 +297,106 @@ class LocalArchitectureTest(unittest.TestCase):
         self.assertIs(untouched, candidates)
         self.assertIsNone(absent)
 
+    def _step_signal(self):
+        from video_retrieval import boundaries
+
+        # Forty seconds; the query matches seconds 15 to 25 and nothing else.
+        vectors = np.zeros((40, 1, 4), dtype=np.float32)
+        vectors[:, 0, 1] = 1.0
+        vectors[15:26, 0] = [1.0, 0.0, 0.0, 0.0]
+        return boundaries.signals(np.arange(40, dtype=float), vectors, np.array([1.0, 0.0, 0.0, 0.0]))
+
+    def _edge_model(self):
+        from video_retrieval import boundaries
+
+        weights = np.zeros(len(boundaries.FEATURES))
+        weights[boundaries.FEATURES.index("edge")] = 1.0
+        weights[boundaries.FEATURES.index("distance")] = -0.05
+        return {"weights": weights.tolist(), "mean": [0.0] * len(weights), "std": [1.0] * len(weights),
+                "window": 8, "context": 4}
+
+    def test_boundaries_move_padded_proposals_onto_the_step(self):
+        from video_retrieval import boundaries
+
+        signal = self._step_signal()
+        self.assertAlmostEqual(float(signal["step"]), 1.0)
+        start, end = boundaries.refine_interval(signal, 10.0, 31.0, self._edge_model())
+        self.assertEqual((start, end), (15.0, 26.0))  # the ten seconds of padding either side are gone
+        # A boundary never moves further than its window.
+        far_start, _ = boundaries.refine_interval(signal, 2.0, 31.0, self._edge_model())
+        self.assertLessEqual(abs(far_start - 2.0), 8.0)
+
+    def test_boundaries_never_cross_and_are_inert_untrained(self):
+        from video_retrieval import boundaries
+
+        # Whatever a model has learned - including nonsense - an answer is never inverted or empty.
+        signal = self._step_signal()
+        generator = np.random.RandomState(0)
+        for _ in range(200):
+            model = {"weights": generator.normal(size=len(boundaries.FEATURES)).tolist(),
+                     "mean": [0.0] * len(boundaries.FEATURES), "std": [1.0] * len(boundaries.FEATURES),
+                     "window": int(generator.randint(1, 12)), "context": int(generator.randint(1, 6))}
+            start = float(generator.randint(0, 38))
+            end = start + float(generator.randint(1, 40 - int(start)))
+            new_start, new_end = boundaries.refine_interval(signal, start, end, model)
+            self.assertTrue(new_end - new_start >= 1.0 or (new_start, new_end) == (start, end))
+        instances = [{"start": 3.0, "end": 9.0}]
+        with patch.object(boundaries, "load_boundary_model", return_value=None):
+            same, info = boundaries.refine_instances({"video": {"path": "x", "duration": 40}}, "q", instances)
+        self.assertIs(same, instances)
+        self.assertIsNone(info)
+        masked = {"mask": [1.0] * len(boundaries.FEATURES)}
+        self.assertTrue(boundaries.uses_cuts(masked))
+        masked["mask"][boundaries.FEATURES.index("cut")] = 0.0
+        self.assertFalse(boundaries.uses_cuts(masked))
+
+    def test_tracking_records_failures_and_notices_changed_inputs(self):
+        from bench import tracking
+
+        with tempfile.TemporaryDirectory() as folder:
+            data = Path(folder) / "data.jsonl"
+            data.write_text("one\n", encoding="utf-8")
+            with tracking.Run("unit", {"alpha": 0.1}, seed=0, inputs=[data], root=folder) as first:
+                first.summarize(score=0.5)
+            data.write_text("two\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                with tracking.Run("unit", {"alpha": 0.2}, seed=0, inputs=[data], root=folder) as second:
+                    raise ValueError("boom")
+            with self.assertRaises(SystemExit):
+                with tracking.Run("unit", {}, root=folder) as third:
+                    raise SystemExit("not enough data yet")
+            runs = {run["id"]: run for run in tracking.load_runs(folder)}
+        self.assertEqual(runs[first.id]["status"], "done")
+        self.assertEqual(runs[second.id]["status"], "failed")
+        self.assertIn("boom", runs[second.id]["error"])
+        self.assertEqual(runs[third.id]["status"], "stopped")  # an early exit is not a crash
+        report = tracking.difference(runs[first.id], runs[second.id])
+        self.assertEqual(report["args"]["alpha"], (0.1, 0.2))
+        self.assertTrue(report["inputs"])  # same path, different bytes
+
+    def test_constructed_timelines_never_repeat_source_seconds(self):
+        import random
+
+        from bench.construct import choose_segments, make_code
+
+        def chunk(video, start, terms):
+            return {"video": video, "video_id": video, "start": start, "end": start + 30,
+                    "terms": terms, "actions": []}
+
+        pool = [chunk("a", 0, ["tennis serve"]), chunk("a", 15, ["tennis rally"]),   # overlaps the first
+                chunk("a", 60, ["tennis serve"]),                                     # repeats its wording
+                chunk("a", 120, ["dog running park"]), chunk("b", 0, ["tennis serve"])]
+        for seed in range(20):
+            chosen = choose_segments(pool, 5, random.Random(seed))
+            for i, left in enumerate(chosen):
+                for right in chosen[i + 1:]:
+                    if left["video_id"] == right["video_id"]:
+                        self.assertFalse(left["start"] < right["end"] and right["start"] < left["end"])
+                        self.assertNotEqual(left["terms"], right["terms"])
+        code = make_code(random.Random(0))
+        self.assertRegex(code, r"^[A-Z]{3}-[0-9]{4}$")
+        self.assertFalse(set(code) & set("OI0158SB"))  # no glyphs a reader could honestly confuse
+
     def _rejecting_ranker(self):
         from video_retrieval import learning
 
