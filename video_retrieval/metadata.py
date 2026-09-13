@@ -1,4 +1,4 @@
-#Breaks a video down into chunks, generates metadata for each chunk, and builds a searchable index of the metadata
+"""Breaks a video down into chunks, generates metadata for each chunk, and builds a searchable index of the metadata."""
 from __future__ import annotations
 
 from . import local_backend
@@ -11,7 +11,7 @@ import numpy as np
 
 from .embeddings import embed_document, embed_query, normalize_embedding
 
-#Metadata to include and extract from the video
+# Metadata to include and extract from the video
 VIDEO_METADATA_SCHEMA = {
     "type": "object",
 
@@ -134,7 +134,7 @@ VIDEO_METADATA_SCHEMA = {
     "additionalProperties": False
 }
 
-#Caption Prompt
+# Caption Prompt
 METADATA_PROMPT = """
 Describe this passage of video so it can be found later by a text search.
 
@@ -182,7 +182,7 @@ Write the summary densely and factually, favoring concrete nouns and verbs over
 interpretation, so that matching it against a search query is easy.
 """
 
-#Analyze one interval of the source video with the local vision model and return structured metadata
+# Analyze one interval of the source video with the local vision model and return structured metadata
 def analyze_video_clip(manifest, start, end):
     return local_backend.interval_json(
         manifest["video"]["path"],
@@ -218,7 +218,7 @@ def add_chunk_context(
 
     return metadata
 
-#Generates metadata for all chunks in a manifest and saves to a JSONL file. Returns the chunks that failed.
+# Generates metadata for all chunks in a manifest and saves to a JSONL file. Returns the chunks that failed.
 def generate_metadata(
     manifest,
     scale="medium",
@@ -291,7 +291,7 @@ def load_jsonl(path):
 
     return output
 
-#Convert metadata into searchable text
+# Convert metadata into searchable text
 def metadata_to_search_text(metadata):
 
     sections = []
@@ -341,7 +341,7 @@ def metadata_to_search_text(metadata):
 
     return "\n".join(sections)
 
-#Create metadata embeddings 
+# Create metadata embeddings
 def embed_metadata_records(
     records,
     save_dir="metadata_index",
@@ -418,7 +418,7 @@ def embed_metadata_records(
 
     return embeddings, index_metadata
 
-#Build FAISS Index for metadata 
+# Build FAISS Index for metadata
 def build_metadata_faiss(
     metadata_embeddings,
     save_path="metadata_index/medium_metadata.faiss"

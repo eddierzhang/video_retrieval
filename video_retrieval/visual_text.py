@@ -1,4 +1,4 @@
-#Handles visual text/OCR retrieval pipeline by scanning video for text-bearing targets
+"""Handles visual text/OCR retrieval pipeline by scanning video for text-bearing targets."""
 from __future__ import annotations
 
 from . import local_backend
@@ -18,7 +18,7 @@ import numpy as np
 from .verification import call_video_json
 from .video import format_timestamp_precise, materialize_final_matches
 
-#JSON format of whole video scan 
+# JSON format of whole video scan
 OCR_VIDEO_SCAN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -54,7 +54,7 @@ OCR_VIDEO_SCAN_SCHEMA = {
     "additionalProperties": False,
 }
 
-#Structured output for full-resolution frame refinement 
+# Structured output for full-resolution frame refinement
 OCR_FRAME_REFINE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -98,7 +98,7 @@ OCR_FRAME_REFINE_SCHEMA = {
     "additionalProperties": False,
 }
 
-#Output when model is only give cropped text regions 
+# Output when model is only give cropped text regions
 OCR_CROP_SCHEMA = {
     "type": "object",
     "properties": {
@@ -121,7 +121,7 @@ OCR_CROP_SCHEMA = {
     "additionalProperties": False,
 }
 
-#Normalize OCR output for display without discarding useful punctuation
+# Normalize OCR output for display without discarding useful punctuation
 def normalize_ocr_text(text: str | None) -> str:
     if not text:
         return ""
@@ -129,12 +129,12 @@ def normalize_ocr_text(text: str | None) -> str:
     text = text.replace("\x00", " ").strip()
     return re.sub(r"\s+", " ", text)
 
-#Aggressive normalization used only for OCR similarity/deduplication
+# Aggressive normalization used only for OCR similarity/deduplication
 def _comparison_key(text: str | None) -> str:
     text = normalize_ocr_text(text).upper()
     return "".join(ch for ch in text if ch.isalnum())
 
-#Measures how similar two OCR readings are
+# Measures how similar two OCR readings are
 def _text_similarity(a: str | None, b: str | None) -> float:
     a_key = _comparison_key(a)
     b_key = _comparison_key(b)
@@ -145,7 +145,7 @@ def _text_similarity(a: str | None, b: str | None) -> float:
     return SequenceMatcher(None, a_key, b_key).ratio()
 
 
-#Sends source frames or crops to the local vision model
+# Sends source frames or crops to the local vision model
 def call_images_json(
     images: list[np.ndarray],
     prompt: str,
@@ -157,7 +157,7 @@ def call_images_json(
         raise ValueError("At least one image is required")
     return local_backend.images_json(images, prompt, schema, role=role)
 
-#Divides video into overlapping windows for scanning 
+# Divides video into overlapping windows for scanning
 def _scan_windows(duration: float, window: float, overlap: float):
     if window <= 0:
         raise ValueError("window must be positive")
@@ -173,7 +173,7 @@ def _scan_windows(duration: float, window: float, overlap: float):
             break
         t += stride
 
-#Performs whole OCR scan 
+# Performs whole OCR scan
 def scan_ocr_candidates(
     manifest: dict,
     *,
@@ -270,7 +270,7 @@ Rules:
 
     return merge_ocr_candidates(candidates)
 
-#MErges duplicate OCR candidates
+# MErges duplicate OCR candidates
 def merge_ocr_candidates(candidates: list[dict], temporal_slack: float = 1.25):
     """Merge duplicate appearances produced by overlapping coarse scan windows."""
     if not candidates:
@@ -342,13 +342,13 @@ def merge_ocr_candidates(candidates: list[dict], temporal_slack: float = 1.25):
 
     return sorted(merged, key=lambda x: x["start"])
 
-#Reads one frame from original video at specific timestamp 
+# Reads one frame from original video at specific timestamp
 def _read_frame(cap: cv2.VideoCapture, timestamp: float) -> np.ndarray | None:
     cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(timestamp)) * 1000.0)
     ok, frame = cap.read()
     return frame if ok else None
 
-#Determines which frames to inspect around coarse candidate 
+# Determines which frames to inspect around coarse candidate
 def _sample_refinement_timestamps(
     candidate: dict,
     *,
@@ -376,7 +376,7 @@ def _sample_refinement_timestamps(
     )
     return sorted(timestamps[: max(1, int(max_frames))])
 
-#Extracts text from target bbox region 
+# Extracts text from target bbox region
 def _clamp_bbox(bbox: dict):
     x1 = max(0.0, min(1000.0, float(bbox.get("x1", 0.0))))
     y1 = max(0.0, min(1000.0, float(bbox.get("y1", 0.0))))
@@ -388,7 +388,7 @@ def _clamp_bbox(bbox: dict):
         y1, y2 = y2, y1
     return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
 
-#tTakes a frame and extracts target text region from normalized bounding box
+# tTakes a frame and extracts target text region from normalized bounding box
 def _crop_from_bbox(frame: np.ndarray, bbox: dict, pad_fraction: float = 0.10):
     h, w = frame.shape[:2]
     bbox = _clamp_bbox(bbox)
@@ -410,14 +410,14 @@ def _crop_from_bbox(frame: np.ndarray, bbox: dict, pad_fraction: float = 0.10):
         return None
     return frame[iy1:iy2, ix1:ix2].copy()
 
-#Measures sharpness of image crop 
+# Measures sharpness of image crop
 def _sharpness(image: np.ndarray) -> float:
     if image is None or image.size == 0:
         return 0.0
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-#Takes coarse OCR candidate and revisits them using the original resolution source frames 
+# Takes coarse OCR candidate and revisits them using the original resolution source frames
 def _refine_candidate_frames(
     manifest: dict,
     candidate: dict,
@@ -538,7 +538,7 @@ Return one reading for every input image.
 
     return readings
 
-#Takes best localized crops and OCRs them again 
+# Takes best localized crops and OCRs them again
 def _read_best_crops(
     readings: list[dict],
     *,
@@ -610,7 +610,7 @@ Return one reading for every input image.
         )
     return output
 
-#Combines multiple readings of same text into one final answer 
+# Combines multiple readings of same text into one final answer
 def consensus_ocr_text(
     readings: Iterable[dict],
     similarity_threshold: float = 0.78,
@@ -656,7 +656,7 @@ def consensus_ocr_text(
     )[:3]
     return canonical, float(sum(confidences) / len(confidences))
 
-#Chooses strongest frame-level observation 
+# Chooses strongest frame-level observation
 def _save_best_evidence(
     candidate: dict,
     readings: list[dict],
@@ -680,7 +680,7 @@ def _save_best_evidence(
     cv2.imwrite(str(crop_path), best["crop"])
     return str(frame_path), str(crop_path), float(best["timestamp"])
 
-#Group repeated temporal appearances that resolve to the same OCR text
+# Group repeated temporal appearances that resolve to the same OCR text
 def _group_unique_texts(matches: list[dict], similarity_threshold: float = 0.90):
     groups: list[dict] = []
 
@@ -724,7 +724,7 @@ def _group_unique_texts(matches: list[dict], similarity_threshold: float = 0.90)
 
     return sorted(groups, key=lambda x: x["text"].casefold())
 
-#main orchestration for entire visual-text pipeline 
+# main orchestration for entire visual-text pipeline
 def run_visual_text_extraction(
     manifest: dict,
     query: str,

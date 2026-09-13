@@ -1,4 +1,4 @@
-#VLM Verification of candidate frames after retrieval
+"""Vision-model verification of candidates, boundary refinement and temporal NMS."""
 from __future__ import annotations
 
 from . import local_backend
@@ -7,7 +7,7 @@ import re
 import time
 from difflib import SequenceMatcher
 
-#Takes info from a planned query and converts to input for verification VLM
+# Takes info from a planned query and converts to input for verification VLM
 def _event_definition_text(plan):
     plan = plan or {}
     definition = plan.get("event_definition", {})
@@ -36,7 +36,7 @@ def _event_definition_text(plan):
 
     return "\n\n".join(lines)
 
-#Split candidate into multiple verification windows
+# Split candidate into multiple verification windows
 def _video_windows(start, end, window=75.0, overlap=12.0):
     start = float(start)
     end = float(end)
@@ -61,7 +61,7 @@ def _video_windows(start, end, window=75.0, overlap=12.0):
     return output
 
 
-#Ask the local vision model about one interval of the source video; returns schema-validated JSON.
+# Ask the local vision model about one interval of the source video; returns schema-validated JSON.
 def call_video_json(
     manifest,
     start,
@@ -81,7 +81,7 @@ def call_video_json(
         include_speech=include_speech,
     )
 
-#Defines output format for verifier
+# Defines output format for verifier
 MULTI_INSTANCE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -114,7 +114,7 @@ MULTI_INSTANCE_SCHEMA = {
     "additionalProperties": False,
 }
 
-#Calculates temporal IoU between two event
+# Calculates temporal IoU between two event
 def temporal_iou(a, b):
     intersection = max(
         0.0,
@@ -127,7 +127,7 @@ def temporal_iou(a, b):
     )
     return 0.0 if union <= 0 else intersection / union
 
-#Compares two actors to determine whether they refer to the same person 
+# Compares two actors to determine whether they refer to the same person
 def _actor_similarity(a, b):
     a = (a or "").strip().lower()
     b = (b or "").strip().lower()
@@ -153,7 +153,7 @@ def _actor_similarity(a, b):
     # Generic descriptions such as "person" contain no identity information.
     return SequenceMatcher(None, a, b).ratio()
 
-#Remove duplicate detections created by overlapping verifier windows.
+# Remove duplicate detections created by overlapping verifier windows.
 def deduplicate_instances(instances, iou_threshold=0.65):
     ordered = sorted(
         instances,
@@ -183,9 +183,7 @@ def deduplicate_instances(instances, iou_threshold=0.65):
 
     return sorted(keep, key=lambda x: x["start"])
 
-    # Detect ZERO, ONE, or MULTIPLE occurrences inside one candidate region.
 
-    # Returned timestamps are absolute timestamps in the original source video.
 def verify_candidate(
     manifest,
     candidate,
@@ -198,7 +196,10 @@ def verify_candidate(
     verifier_overlap_seconds=5.0,
     min_confidence=0.25,
 ):
+    """Find zero, one or several occurrences inside one candidate region.
 
+    Returned timestamps are absolute times in the original source video.
+    """
     definition_text = _event_definition_text(plan)
     all_instances = []
 
@@ -276,7 +277,7 @@ Rules:
 
     return deduplicate_instances(all_instances, iou_threshold=0.65)
 
-#Run exhaustive Flash verification over candidate regions
+# Run exhaustive Flash verification over candidate regions
 def verify_candidates_flash(
     manifest,
     candidates,
@@ -304,7 +305,7 @@ def verify_candidates_flash(
 
     return deduplicate_instances(instances, iou_threshold=0.65)
 
-#Second stage verifier
+# Second stage verifier
 PRO_VERIFY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -328,7 +329,7 @@ PRO_VERIFY_SCHEMA = {
     "additionalProperties": False,
 }
 
-#Stricter second verification of one first-pass occurrence
+# Stricter second verification of one first-pass occurrence
 def verify_instance_pro(
     manifest,
     instance,
@@ -410,7 +411,7 @@ shows only the surrounding context.
     })
     return verified
 
-#Verify all remaining candidates with Pro 
+# Verify all remaining candidates with Pro
 def verify_instances_pro(
     manifest,
     instances,
@@ -433,7 +434,7 @@ def verify_instances_pro(
 
     return deduplicate_instances(verified, iou_threshold=0.70)
 
-#Defines output for video boundary refinement
+# Defines output for video boundary refinement
 BOUNDARY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -455,7 +456,7 @@ BOUNDARY_SCHEMA = {
     "additionalProperties": False,
 }
 
-#Creates two short overlapping clips around current boundary estimate to locate real boundary
+# Creates two short overlapping clips around current boundary estimate to locate real boundary
 def _boundary_probe_windows(estimate, window_size, video_duration):
     """Two overlapping windows around the current boundary estimate."""
     w = float(window_size)
@@ -475,7 +476,7 @@ def _boundary_probe_windows(estimate, window_size, video_duration):
             unique.append(item)
     return unique
 
-#Refines one boundary by identifying which clip contains exact start transition
+# Refines one boundary by identifying which clip contains exact start transition
 def refine_boundary(
     manifest,
     query,
@@ -576,7 +577,7 @@ show it.
 
     return estimate, history
 
-#Refines both start and end boundary
+# Refines both start and end boundary
 def refine_instance(
     manifest,
     instance,
@@ -622,7 +623,7 @@ def refine_instance(
     })
     return refined
 
-#Refine instance over all confirmed events 
+# Refine instance over all confirmed events
 def refine_instances(
     manifest,
     instances,
@@ -643,7 +644,7 @@ def refine_instances(
         )
     return output
 
-#Detects and removes duplicates in overlapping windows
+# Detects and removes duplicates in overlapping windows
 def temporal_nms(
     detections,
     iou_threshold=0.55,

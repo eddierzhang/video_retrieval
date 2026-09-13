@@ -1,4 +1,4 @@
-#Extracting text from video frames
+"""Extracting text from video frames."""
 from __future__ import annotations
 
 from .visual_text import (
@@ -7,7 +7,7 @@ from .visual_text import (
     run_visual_text_extraction,
 )
 
-#Runs visual OCR extraction depending on the query and the target object and region specified by the user. Returns the extracted text from the video frames.
+# Runs visual OCR extraction depending on the query and the target object and region specified by the user. Returns the extracted text from the video frames.
 def run_visual_ocr(
     manifest: dict,
     query: str,

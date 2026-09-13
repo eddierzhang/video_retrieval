@@ -45,7 +45,6 @@ from video_retrieval.boundaries import (
     FEATURES,
     candidate_matrix,
     frame_index,
-    frame_time,
     refine_interval,
     signals,
 )

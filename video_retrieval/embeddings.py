@@ -8,24 +8,24 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-#Embed text into the CLIP space shared with video chunks.
+# Embed text into the CLIP space shared with video chunks.
 def embed_text(text):
     return local_backend.embed_text(text)
 
-#Embed one interval of the source video as the mean of its CLIP frame embeddings.
+# Embed one interval of the source video as the mean of its CLIP frame embeddings.
 def embed_video_interval(video_path, start, end):
     return local_backend.embed_video_interval(video_path, start, end)
 
-#Embed a scene description or transcript window with the dedicated text model.
+# Embed a scene description or transcript window with the dedicated text model.
 def embed_document(text):
     return local_backend.embed_document(text)
 
-#Embed a query for the scene and transcript indexes.
+# Embed a query for the scene and transcript indexes.
 def embed_query(text):
     return local_backend.embed_query(text)
 
 
-#Return an L2-normalized float32 vector.
+# Return an L2-normalized float32 vector.
 def normalize_embedding(x):
     x = np.asarray(x, dtype=np.float32)
     norm = np.linalg.norm(x)
@@ -35,7 +35,7 @@ def normalize_embedding(x):
 
     return x / norm
 
-#Get the duration of a chunk
+# Get the duration of a chunk
 def _duration(record: Mapping[str, Any]) -> float:
     if record.get("duration") is not None:
         return max(0.0, float(record["duration"]))
@@ -44,7 +44,7 @@ def _duration(record: Mapping[str, Any]) -> float:
         float(record.get("end", 0.0)) - float(record.get("start", 0.0)),
     )
 
-#Order scales from largest to finest, e.g. coarse, medium, fine
+# Order scales from largest to finest, e.g. coarse, medium, fine
 def _scale_order_from_metadata(
     metadata_by_scale: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> List[str]:
@@ -64,7 +64,7 @@ def _scale_order_from_metadata(
         )
     ]
 
-#Calculate amount of overlap between two intervals 
+# Calculate amount of overlap between two intervals
 def _interval_overlap(a: Mapping[str, Any], b: Mapping[str, Any]) -> float:
     return max(
         0.0,
@@ -72,7 +72,7 @@ def _interval_overlap(a: Mapping[str, Any], b: Mapping[str, Any]) -> float:
         - max(float(a["start"]), float(b["start"])),
     )
 
-#Return candidate parents for a child.
+# Return candidate parents for a child.
 def _best_parent_indices(
     child: Mapping[str, Any],
     parent_records: Sequence[Mapping[str, Any]],
@@ -120,7 +120,7 @@ def _best_parent_indices(
     overlapping.sort(key=lambda x: x[1], reverse=True)
     return [idx for idx, _ in overlapping]
 
-#Infer adjacent parent/child links from timestamps.
+# Infer adjacent parent/child links from timestamps.
 def infer_hierarchy_links(
     metadata_by_scale: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> Dict[str, List[Dict[str, Any]]]:
@@ -206,7 +206,7 @@ def infer_hierarchy_links(
 
     return output
 
-#Embed every video chunk at one scale and persist vectors + timestamp metadata. Preserves parent/child data from manifest
+# Embed every video chunk at one scale and persist vectors + timestamp metadata. Preserves parent/child data from manifest
 def embed_scale(
     manifest,
     scale="medium",
@@ -264,7 +264,7 @@ def embed_scale(
 
     return embeddings, metadata
 
-#Build a normalized inner-product FAISS index (cosine similarity).
+# Build a normalized inner-product FAISS index (cosine similarity).
 def build_faiss_index(
     embeddings,
     save_path=None,
@@ -389,12 +389,12 @@ class HierarchicalVideoIndex:
         self.ntotal = len(self.output_metadata)
         self.d = int(expected_dim or 0)
 
-    #Score each chunk by its best-matching view, so a tile can match on its own
+    # Score each chunk by its best-matching view, so a tile can match on its own
     @staticmethod
     def _view_scores(vectors, query):
         return (vectors @ query).max(axis=-1)
 
-    #Returns the indexes of the top scoring candidates
+    # Returns the indexes of the top scoring candidates
     def _top_indices(
         self,
         scores: np.ndarray,
@@ -434,7 +434,7 @@ class HierarchicalVideoIndex:
             int(candidate_indices[int(i)])
             for i in order
         ]
-    #Hierarchical search algorithm, searches one query embedding at every scale 
+    # Hierarchical search algorithm, searches one query embedding at every scale
     def _search_one(
         self,
         query: np.ndarray,
@@ -570,7 +570,7 @@ class HierarchicalVideoIndex:
 
         return final_scores, final_indices
 
-    #Search function meant to mimic FAISS 
+    # Search function meant to mimic FAISS
     def search(
         self,
         query_embeddings,
@@ -622,7 +622,7 @@ class HierarchicalVideoIndex:
 
         return all_scores, all_indices
 
-#Builds hierarchical index from already-existing embeddings 
+# Builds hierarchical index from already-existing embeddings
 def build_multiscale_video_index(
     embeddings_by_scale,
     metadata_by_scale,
@@ -638,7 +638,7 @@ def build_multiscale_video_index(
 
     return index, index.output_metadata
 
-#Embed all scales for a new video 
+# Embed all scales for a new video
 def embed_all_scales(
     manifest,
     scales=None,
@@ -719,7 +719,7 @@ def embed_all_scales(
 
     return index, index.output_metadata
 
-#Discover what scales have been saved 
+# Discover what scales have been saved
 def _discover_saved_scales(save_dir: Path) -> List[str]:
     scales = []
 
@@ -737,7 +737,7 @@ def _discover_saved_scales(save_dir: Path) -> List[str]:
 
     return sorted(set(scales))
 
-#Load every saved visual scale and rebuild the lightweight hierarchical index.
+# Load every saved visual scale and rebuild the lightweight hierarchical index.
 def load_multiscale_video_index(
     save_dir="embedding_indices",
     scales=None,
@@ -861,7 +861,7 @@ def search_video(
 
     return results
 
-#Load new hierarchical index
+# Load new hierarchical index
 def load_video_index(
     save_dir="embedding_indices",
     scale="medium",

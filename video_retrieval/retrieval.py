@@ -1,4 +1,4 @@
-#Query planning, multimodal retrieval, fusion, and initial candidate clustering.
+"""Query planning, multimodal retrieval, fusion, and initial candidate clustering."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -80,7 +80,7 @@ already know ("what does it say", "read the code", "which number", "what is the 
     return {"stated_text": str(answer.get("stated_text", "")).strip(),
             "asks_for_unknown_text": bool(answer.get("asks_for_unknown_text", True))}
 
-#Turns natural language query into a structured prompt
+# Turns natural language query into a structured prompt
 def plan_query(query):
 
     prompt = f"""
@@ -543,7 +543,7 @@ General planning rules:
         plan["weights"] = weights
 
     return plan
-#Removes duplicate queries that are produced by the planner
+# Removes duplicate queries that are produced by the planner
 def _dedupe_query_specs(specs):
     output = []
     by_text = {}
@@ -567,7 +567,7 @@ def _dedupe_query_specs(specs):
 
     return output
 
-#Decides what queries need to be run for a specific channel
+# Decides what queries need to be run for a specific channel
 def _query_specs_for_channel(plan, channel):
     if channel == "video":
         base_queries = plan.get("visual_queries", [])
@@ -600,7 +600,7 @@ def _query_specs_for_channel(plan, channel):
 
     return _dedupe_query_specs(specs)
 
-#Analyzes why prediction was created
+# Analyzes why prediction was created
 def _annotate_ranking(ranking, spec, channel):
     annotated = []
     for item in ranking:
@@ -614,7 +614,7 @@ def _annotate_ranking(ranking, spec, channel):
         annotated.append(row)
     return annotated
 
-#Execute both full-query searches and atomic evidence-predicate searches. Outputs retrieval results for each search channel
+# Execute both full-query searches and atomic evidence-predicate searches. Outputs retrieval results for each search channel
 def run_retrieval_plan(
     plan,
     video_index,
@@ -705,14 +705,14 @@ def run_retrieval_plan(
 
     return results
 
-#Converts timestamp into a numbered bin
+# Converts timestamp into a numbered bin
 def timestamp_bin(seconds, bin_size=5):
 
     return int(
         seconds // bin_size
     )
 
-#Flattens rankings
+# Flattens rankings
 def flatten_rankings(
     rankings
 ):
@@ -724,7 +724,7 @@ def flatten_rankings(
 
     return output
 
-#Assigns each finding into a different timestamp bin
+# Assigns each finding into a different timestamp bin
 def add_ranking_to_fusion(
     fused,
     ranking,
@@ -779,7 +779,7 @@ def add_ranking_to_fusion(
             item
         )
 
-#Calls above method for all four channels
+# Calls above method for all four channels
 def fuse_retrieval_results(
     retrieval_results,
     plan,
@@ -849,7 +849,7 @@ def fuse_retrieval_results(
 
     return ranked
 
-#Converts and normalizes all ranking scores to between 0 and 1
+# Converts and normalizes all ranking scores to between 0 and 1
 def _calibrate_ranking_scores(ranking):
     """Map one retrieval ranking to stable 0..1 scores without mixing raw modalities."""
     if not ranking:
@@ -889,7 +889,7 @@ def _calibrate_ranking_scores(ranking):
 
     return output
 
-#Smooth evidence scores between neighboring time bins
+# Smooth evidence scores between neighboring time bins
 def _smooth_series(values, radius=1):
     if radius <= 0 or len(values) <= 1:
         return list(values)
@@ -1031,7 +1031,7 @@ def build_temporal_evidence_map(
 
     return evidence_map
 
-#Finds significant regions along a timeline
+# Finds significant regions along a timeline
 def candidates_from_evidence_map(
     evidence_map,
     max_gap=10.0,
@@ -1098,7 +1098,7 @@ def candidates_from_evidence_map(
 
     return regions
 
-#Score of an arbitrary window based on the scores inside the window
+# Score of an arbitrary window based on the scores inside the window
 def _window_evidence_score(evidence_map, start, end):
     rows = [
         row for row in evidence_map
@@ -1117,7 +1117,7 @@ def _window_evidence_score(evidence_map, start, end):
              + weights_used["window_mean"] * mean)
     return score, len(rows), [int(row["bin_id"]) for row in rows]
 
-#Generates smaller overlapping windows from one larger window
+# Generates smaller overlapping windows from one larger window
 def _generate_child_windows(start, end, child_width, overlap=0.50):
     width = end - start
     if child_width >= width - 1e-9:
@@ -1137,13 +1137,13 @@ def _generate_child_windows(start, end, child_width, overlap=0.50):
         t += stride
     return windows
 
-#Calculates temporal IoU
+# Calculates temporal IoU
 def _interval_iou(a, b):
     intersection = max(0.0, min(a["end"], b["end"]) - max(a["start"], b["start"]))
     union = max(a["end"], b["end"]) - min(a["start"], b["start"])
     return 0.0 if union <= 0 else intersection / union
 
-#Recursively zoom candidate regions toward dense evidence peaks.
+# Recursively zoom candidate regions toward dense evidence peaks.
 def recursive_refine_candidates(
     evidence_map,
     candidates,
@@ -1291,7 +1291,7 @@ def recursive_refine_candidates(
     return deduped
 
 
-#Best-scoring moment inside a window for each evidence predicate
+# Best-scoring moment inside a window for each evidence predicate
 def _predicate_peaks(retrieval_results, start, end):
     peaks = {}
     for rankings in retrieval_results.values():
@@ -1308,7 +1308,7 @@ def _predicate_peaks(retrieval_results, start, end):
     return {predicate: center for predicate, (_, center) in peaks.items()}
 
 
-#Reward candidates whose evidence appears in the order the planner asked for
+# Reward candidates whose evidence appears in the order the planner asked for
 def apply_temporal_ordering(candidates, retrieval_results, plan):
     """Re-rank candidates by whether required orderings hold inside them.
 

@@ -1,4 +1,4 @@
-#Pipeline for video retrieval
+"""The retrieval pipeline: from a question to timestamped clips, for one indexed video."""
 from __future__ import annotations
 
 from contextlib import nullcontext
@@ -14,7 +14,6 @@ from .config import DATA_DIR
 from .local_backend import LocalModels, use_models
 from .retrieval import (
     apply_temporal_ordering,
-    scoring_override,
     build_temporal_evidence_map,
     candidates_from_evidence_map,
     cluster_fused_results,
@@ -22,6 +21,7 @@ from .retrieval import (
     plan_query,
     recursive_refine_candidates,
     run_retrieval_plan,
+    scoring_override,
 )
 from .visual_text import run_visual_text_extraction
 from .verification import refine_instances, temporal_nms, verify_candidates_flash, verify_instances_pro
@@ -42,8 +42,9 @@ SEARCH_STAGES = [
 
 
 @dataclass
-#All precomputed indices and metadata needed for retrieval
 class RetrievalResources:
+    """Every precomputed index and record a search over one video needs."""
+
     manifest: dict
     video_index: Any = None
     video_metadata: list[dict] | None = None
@@ -54,8 +55,9 @@ class RetrievalResources:
     transcript_metadata: list[dict] | None = None
     local_models: Any = None
 
-#Wrapper Class
 class VideoRetrievalPipeline:
+    """One indexed video, ready to answer questions with the configured local models."""
+
     def __init__(self, resources: RetrievalResources):
         self.resources = resources
 
@@ -196,7 +198,6 @@ def retrieval_instances(candidates):
     ]
 
 
-#Method to retrieve the actual video. Each final match contains precise timestamps, a matching clip, and matching frame paths extracted from the original source video.
 def retrieve_video(
     query,
     resources: RetrievalResources,
@@ -240,6 +241,10 @@ def retrieve_video(
     include_diagnostics=True,
     include_evidence_map=False,
 ):
+    """Answer `query` against one video.
+
+    Each match carries precise timestamps, a clip and frames cut from the original source.
+    """
     manifest = resources.manifest
     video_index = resources.video_index
     video_metadata = resources.video_metadata

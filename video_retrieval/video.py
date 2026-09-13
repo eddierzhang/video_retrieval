@@ -1,4 +1,4 @@
-#Video chunking and utilities for temporal search.
+"""Video chunking and utilities for temporal search."""
 from __future__ import annotations
 
 import hashlib
@@ -12,7 +12,7 @@ import numpy as np
 from tqdm import tqdm
 
 
-#Probe duration, frame size, and codecs with ffprobe.
+# Probe duration, frame size, and codecs with ffprobe.
 def probe_video(video_path):
     result = subprocess.run(
         [
@@ -43,7 +43,7 @@ def probe_video(video_path):
         "audio_codec": audio.get("codec_name"),
     }
 
-#Get video duration in seconds using ffprobe.
+# Get video duration in seconds using ffprobe.
 def get_video_duration(video_path):
     return probe_video(video_path)["duration"]
 
@@ -80,14 +80,14 @@ def generate_windows(
 
     return windows
 
-#Calculates overalp between two clips
+# Calculates overalp between two clips
 def temporal_overlap(a_start, a_end, b_start, b_end):
     return max(
         0.0,
         min(a_end, b_end) - max(a_start, b_start)
     )
 
-#Creates a video chunk of specified duration and start time
+# Creates a video chunk of specified duration and start time
 def create_clip(
     video_path,
     output_path,
@@ -206,7 +206,7 @@ def split_video_hierarchically(
     }
 
     chunks = {}
-    #Generate info about each video chunk 
+    # Generate info about each video chunk
     for scale_name, config in scales.items():
 
         windows = generate_windows(
@@ -271,7 +271,7 @@ def split_video_hierarchically(
 
         if export_clips:
             print()
-    #Hierarchy enables searching from coarse to fine
+    # Hierarchy enables searching from coarse to fine
     hierarchy_levels = [
         ("coarse", "medium"),
         ("medium", "fine"),
@@ -303,7 +303,7 @@ def split_video_hierarchically(
                         child["chunk_id"]
                     )
 
-    #output saved data
+    # output saved data
     manifest = {
         "video": {
             "path": str(video_path.resolve()),
@@ -341,7 +341,7 @@ def split_video_hierarchically(
 
     return manifest
 
-#Converts chunk into a video file only when needed for model processing.
+# Converts chunk into a video file only when needed for model processing.
 def materialize_chunk(
     manifest,
     chunk,
@@ -381,7 +381,7 @@ def _safe_stem(text):
     text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text))
     return text[:80] or "video"
 
-#Specific Video Path for different time segments to ensure no duplicates
+# Specific Video Path for different time segments to ensure no duplicates
 def interval_cache_key(manifest, start, end, prefix="interval"):
     """Stable cache key that cannot collide across queries or source videos."""
     video_path = str(Path(manifest["video"]["path"]).resolve())
@@ -391,7 +391,7 @@ def interval_cache_key(manifest, start, end, prefix="interval"):
     end_ms = int(round(float(end) * 1000))
     return f"{prefix}_{video_stem}_{video_hash}_{start_ms:010d}_{end_ms:010d}"
 
-#Extract an original-quality candidate interval with query-safe caching
+# Extract an original-quality candidate interval with query-safe caching
 def extract_candidate_clip(
     manifest,
     candidate,
@@ -508,7 +508,7 @@ def materialize_candidates(
     return output
 
 
-#Extract one clip from the original video 
+# Extract one clip from the original video
 def extract_final_clip(
     manifest,
     match,
@@ -550,7 +550,7 @@ def extract_final_clip(
 
     return output_path
 
-#Extract matching frames from the original video 
+# Extract matching frames from the original video
 def extract_match_frames(
     manifest,
     match,
@@ -617,7 +617,7 @@ def extract_match_frames(
     cap.release()
     return frames
 
-#Create final clips and matching frames 
+# Create final clips and matching frames
 def materialize_final_matches(
     manifest,
     matches,

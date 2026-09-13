@@ -1,4 +1,4 @@
-#Audio transcription plus semantic and BM25 transcript retrieval
+"""Audio transcription plus semantic and BM25 transcript retrieval."""
 from __future__ import annotations
 
 from . import local_backend
@@ -13,7 +13,7 @@ import numpy as np
 from .embeddings import embed_document, embed_query, normalize_embedding
 
 
-#Transcribe the whole video once with local Whisper and save absolute word/segment timestamps
+# Transcribe the whole video once with local Whisper and save absolute word/segment timestamps
 def transcribe_video(
     manifest,
     output_dir="transcript",
@@ -34,7 +34,7 @@ def transcribe_video(
 
     return words, segments
 
-#Build overlapping timestamped transcript windows (in accordance with video chunks).
+# Build overlapping timestamped transcript windows (in accordance with video chunks).
 def create_transcript_windows(
     words,
     video_duration,
@@ -90,7 +90,7 @@ def create_transcript_windows(
 
     return windows
 
-#Embed transcript windows with Gemini Embedding 2 
+# Embed transcript windows with Gemini Embedding 2
 def embed_transcript_windows(
     windows,
 
@@ -182,7 +182,7 @@ def embed_transcript_windows(
 
     return embeddings, metadata
 
-#Build a FAISS index for the transcript embeddings and save it to disk.
+# Build a FAISS index for the transcript embeddings and save it to disk.
 def build_transcript_faiss(
     embeddings,
 
@@ -228,7 +228,7 @@ def tokenize_text(text):
         text.lower()
     )
 
-#Build a BM25 index for the transcript metadata 
+# Build a BM25 index for the transcript metadata
 def build_bm25(
     transcript_metadata
 ):
@@ -246,7 +246,7 @@ def build_bm25(
     return BM25Okapi(
         tokenized_documents
     )
-#Search transcript metadata using semantic (FAISS) and BM25 methods. 
+# Search transcript metadata using semantic (FAISS) and BM25 methods.
 def search_transcript_semantic(
     query,
 
@@ -337,7 +337,7 @@ def search_transcript_bm25(
 
     return results
 
-#Combine semantic with BM25 Seaches
+# Combine semantic with BM25 Seaches
 def search_transcript(
     query,
 

@@ -1,4 +1,4 @@
-#Creates public imports for the video_retrieval package.
+"""Creates public imports for the video_retrieval package."""
 from .embeddings import (
     HierarchicalVideoIndex,
     build_multiscale_video_index,
