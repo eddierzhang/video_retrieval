@@ -4,6 +4,7 @@ from __future__ import annotations
 from . import local_backend
 
 import re
+import time
 from difflib import SequenceMatcher
 
 #Takes info from a planned query and converts to input for verification VLM
@@ -289,6 +290,7 @@ def verify_candidates_flash(
     instances = []
 
     for candidate in local_backend.track(selected, "Verifying candidates"):
+        started = time.perf_counter()
         found = verify_candidate(
             manifest,
             candidate,
@@ -296,6 +298,8 @@ def verify_candidates_flash(
             plan=plan,
             **verify_kwargs,
         )
+        # What this candidate cost, so a replay of the search can charge it honestly.
+        candidate["verify_seconds"] = round(time.perf_counter() - started, 3)
         instances.extend(found)
 
     return deduplicate_instances(instances, iou_threshold=0.65)

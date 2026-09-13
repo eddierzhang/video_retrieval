@@ -19,6 +19,7 @@ import json
 
 import numpy as np
 
+from bench.tracking import Run, seed_everything
 from video_retrieval.learning import CANDIDATE_EXAMPLES, FEATURE_NAMES, PREFILTER_MODEL, load_examples, vectorize
 
 MIN_EXAMPLES = 40
@@ -61,8 +62,16 @@ def main():
     parser.add_argument("--out", default=str(PREFILTER_MODEL))
     parser.add_argument("--keep-recall", type=float, default=0.95, help="fraction of confirmed candidates the filter must keep")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    seed_everything(args.seed)
+    with Run("distill", args, seed=args.seed, inputs=[args.examples]) as run:
+        print(f"run {run.id}")
+        distill(args, run)
+
+
+def distill(args, run):
     rows = load_examples(args.examples)
     if not rows:
         raise SystemExit(f"No examples yet at {args.examples}. Run some verified searches first.")
@@ -80,7 +89,7 @@ def main():
     if len(rows) < MIN_EXAMPLES or labels.sum() < 5 or (1 - labels).sum() < 5:
         raise SystemExit(f"Not enough data yet: need {MIN_EXAMPLES}+ candidates with at least 5 of each outcome.")
 
-    order = np.random.RandomState(0).permutation(len(labels))
+    order = np.random.RandomState(args.seed).permutation(len(labels))
     split = int(len(order) * 0.8)
     train, holdout = order[:split], order[split:]
     mean, std = features[train].mean(axis=0), features[train].std(axis=0)
@@ -111,6 +120,9 @@ def main():
     PREFILTER_MODEL.parent.mkdir(parents=True, exist_ok=True)
     open(args.out, "w", encoding="utf-8").write(json.dumps(model, indent=2))
     print("written to", args.out)
+    run.artifact(args.out, "candidate_prefilter")
+    run.summarize(examples=len(rows), threshold=threshold, holdout_auc=model["holdout_auc"],
+                  kept=float(kept.mean()))
 
 
 if __name__ == "__main__":

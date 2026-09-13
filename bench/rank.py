@@ -6,6 +6,10 @@
     python -m bench.rank --alpha 0.2         accept 80% coverage for smaller sets
     python -m bench.rank --learning-curve    is it short of data, or short of model?
     python -m bench.rank --ablate            which features carry the signal
+    python -m bench.rank --seed 3            a different split and initialisation
+
+Every invocation is recorded under bench/runs/ (see bench.tracking), including the hash of the
+candidate log it read, so two results can be checked for "the data changed" before comparing.
 
 Every verified search appends one row per candidate to local_data/learning/candidates.jsonl:
 the features retrieval had already computed, and whether the vision model's verdict confirmed
@@ -44,7 +48,9 @@ from pathlib import Path
 
 import numpy as np
 
+from bench.tracking import Run, seed_everything
 from video_retrieval.learning import (
+    CANDIDATE_EXAMPLES,
     FEATURE_NAMES,
     RANKER_MODEL,
     load_examples,
@@ -273,9 +279,9 @@ def evaluate_sets(groups, probability_of, threshold, keep_min=3):
 
 # ------------------------------------------------------------------- driver
 
-def build(fit, calibration, test, loss_name, hidden, epochs, alpha, mask=None, verbose=False):
+def build(fit, calibration, test, loss_name, hidden, epochs, alpha, mask=None, verbose=False, seed=0):
     """Train, calibrate on the middle split, and measure on the last one."""
-    model = train(fit, loss_name, hidden=hidden, epochs=epochs, mask=mask, verbose=verbose)
+    model = train(fit, loss_name, hidden=hidden, epochs=epochs, seed=seed, mask=mask, verbose=verbose)
     score_of = lambda group: ranker_scores(model, group["features"])
     model["platt"] = fit_platt(np.concatenate([score_of(group) for group in fit]),
                                np.concatenate([group["labels"] for group in fit]))
@@ -300,79 +306,87 @@ def describe(groups):
     return both
 
 
-def learning_curve(fit, calibration, test, loss_name, args, seed=0):
+
+
+def learning_curve(fit, calibration, test, loss_name, args, run=None):
     """Train on a growing slice of the fit split: is this short of data, or short of model?"""
     print(f"\nlearning curve ({loss_name}, held-out ndcg@5)")
-    order = np.random.RandomState(seed).permutation(len(fit))
+    order = np.random.RandomState(args.seed).permutation(len(fit))
     rows = []
     for fraction in (0.25, 0.5, 0.75, 1.0):
         take = max(2, int(len(fit) * fraction))
         subset = [fit[index] for index in order[:take]]
         try:
-            result = build(subset, calibration, test, loss_name, args.hidden, args.epochs, args.alpha)
+            result = build(subset, calibration, test, loss_name, args.hidden, args.epochs, args.alpha,
+                           seed=args.seed)
         except SystemExit as stop:
             print(f"   {take:>4} searches   {stop}")
             continue
         rows.append((take, result["quality"]["ndcg"]))
         print(f"   {take:>4} searches   ndcg@5 {result['quality']['ndcg']:.3f}")
+        if run:
+            run.log({"curve_searches": take, "ndcg": result["quality"]["ndcg"], "loss": loss_name}, step=take)
     if len(rows) >= 2:
         slope = rows[-1][1] - rows[-2][1]
-        print(f"   the last {rows[-1][0] - rows[-2][0]} searches moved ndcg@5 by {slope:+.3f} - "
-              f"{'more data should still help' if slope > 0.01 else 'more data is not the bottleneck'}")
+        verdict = "more data should still help" if slope > 0.01 else "more data is not the bottleneck"
+        print(f"   the last {rows[-1][0] - rows[-2][0]} searches moved ndcg@5 by {slope:+.3f} - {verdict}")
+        if run:
+            run.summarize(learning_curve={"points": rows, "last_slope": slope, "verdict": verdict})
 
 
-def ablate(fit, calibration, test, loss_name, args, full):
+def ablate(fit, calibration, test, loss_name, args, full, run=None):
     """Drop each group of features and see what the ordering loses without them."""
     print(f"\nfeature ablation ({loss_name}, held-out ndcg@5, full model {full:.3f})")
+    drops = {}
     for name in FEATURE_GROUPS:
         result = build(fit, calibration, test, loss_name, args.hidden, args.epochs, args.alpha,
-                       mask=feature_mask([name]))
+                       mask=feature_mask([name]), seed=args.seed)
         score = result["quality"]["ndcg"]
+        drops[name] = score - full
         print(f"   without {name:<10} {score:.3f}   {score - full:+.3f}")
+        if run:
+            run.log({"ablated": name, "ndcg": score, "change": score - full, "loss": loss_name})
+    if run:
+        run.summarize(ablation=drops)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--examples", default=None)
-    parser.add_argument("--loss", choices=LOSSES + ("all",), default="all")
-    parser.add_argument("--alpha", type=float, default=0.1, help="1 - alpha is the coverage target")
-    parser.add_argument("--hidden", type=int, default=32, help="0 for a linear model")
-    parser.add_argument("--epochs", type=int, default=400)
-    parser.add_argument("--min-searches", type=int, default=20)
-    parser.add_argument("--learning-curve", action="store_true")
-    parser.add_argument("--ablate", action="store_true")
-    parser.add_argument("--out", default=str(RANKER_MODEL))
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-
-    rows = load_examples(args.examples) if args.examples else load_examples()
+def run_ranking(args, run):
+    examples = Path(args.examples) if args.examples else CANDIDATE_EXAMPLES
+    run.input(examples)
+    rows = load_examples(examples)
     if not rows:
         raise SystemExit("No examples yet. Run some verified searches first.")
     groups = [group for group in group_searches(rows) if len(group["labels"]) >= 2]
     usable = describe(groups)
+    run.summarize(searches=len(groups), usable_searches=usable,
+                  candidates=sum(len(group["labels"]) for group in groups))
     if args.dry_run:
         return
     if len(groups) < args.min_searches or usable < 5:
         raise SystemExit(f"Not enough data yet: need {args.min_searches}+ searches, at least 5 of "
                          f"them with both outcomes. Run `python -m bench.run --mode verified`.")
 
-    fit, calibration, test = split_searches(groups)
+    fit, calibration, test = split_searches(groups, seed=args.seed)
     print(f"searches: {len(fit)} fit, {len(calibration)} calibrate, {len(test)} test")
     raw = lambda group: group["features"][:, FEATURE_NAMES.index("score")]
     baseline = measure(test, raw)
+    run.summarize(baseline=baseline)
     print("\nbaseline - candidates in retrieval's own order")
     print(f"   ndcg@5 {baseline['ndcg']:.3f}   mrr {baseline['mrr']:.3f}   recall@3 {baseline['recall@3']:.3f}")
 
     results = {}
     for loss_name in (LOSSES if args.loss == "all" else (args.loss,)):
         print(f"\n{loss_name}")
-        result = build(fit, calibration, test, loss_name, args.hidden, args.epochs, args.alpha, verbose=True)
+        result = build(fit, calibration, test, loss_name, args.hidden, args.epochs, args.alpha,
+                       verbose=True, seed=args.seed)
         conformal, quality, sets = result["model"]["conformal"], result["quality"], result["sets"]
         print(f"   ndcg@5 {quality['ndcg']:.3f}   mrr {quality['mrr']:.3f}   recall@3 {quality['recall@3']:.3f}")
         print(f"   conformal threshold {conformal['threshold']:.3f} from {conformal['calibration_searches']} searches")
         print(f"   test coverage {sets['coverage']:.1%} (target {conformal['coverage']:.0%})   "
               f"verifies {sets['candidates_kept']:.1%} of candidates   "
               f"keeps {sets['confirmed_kept']:.1%} of confirmed ones")
+        run.log({"loss": loss_name, **quality, **{f"set_{key}": value for key, value in sets.items()},
+                 "threshold": conformal["threshold"]})
         results[loss_name] = result
 
     print("\n" + "-" * 78)
@@ -385,28 +399,56 @@ def main():
               f"{result['sets']['candidates_kept']:>11.1%}")
 
     best = max(results, key=lambda name: results[name]["quality"]["ndcg"])
+    run.summarize(losses={name: {**result["quality"], **result["sets"]} for name, result in results.items()},
+                  best_loss=best)
     if args.learning_curve:
-        learning_curve(fit, calibration, test, best, args)
+        learning_curve(fit, calibration, test, best, args, run)
     if args.ablate:
-        ablate(fit, calibration, test, best, args, results[best]["quality"]["ndcg"])
+        ablate(fit, calibration, test, best, args, results[best]["quality"]["ndcg"], run)
 
     if not results[best]["quality"]["ndcg"] > baseline["ndcg"]:
         print("\nNo loss beat retrieval's own ordering on held-out searches, so nothing is saved.")
         print("Collect more verified searches and try again.")
+        run.summarize(saved=False)
         return
 
     model = results[best]["model"]
     model.update({
         "trained_at": datetime.now().isoformat(timespec="seconds"),
+        "run": run.id,
         "loss": best,
         "features": list(FEATURE_NAMES),
+        "seed": args.seed,
         "searches": len(groups),
         "candidates": sum(len(group["labels"]) for group in groups),
         "metrics": {"baseline": baseline, "test": results[best]["quality"], "sets": results[best]["sets"]},
     })
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(model, indent=2), encoding="utf-8")
+    run.artifact(args.out, "candidate_ranker")
+    run.summarize(saved=True)
     print(f"\nkept the {best} model, written to {args.out}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--examples", default=None)
+    parser.add_argument("--loss", choices=LOSSES + ("all",), default="all")
+    parser.add_argument("--alpha", type=float, default=0.1, help="1 - alpha is the coverage target")
+    parser.add_argument("--hidden", type=int, default=32, help="0 for a linear model")
+    parser.add_argument("--epochs", type=int, default=400)
+    parser.add_argument("--min-searches", type=int, default=20)
+    parser.add_argument("--learning-curve", action="store_true")
+    parser.add_argument("--ablate", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--out", default=str(RANKER_MODEL))
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    seed_everything(args.seed)
+    with Run("rank", args, seed=args.seed) as run:
+        print(f"run {run.id}")
+        run_ranking(args, run)
 
 
 if __name__ == "__main__":

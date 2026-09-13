@@ -85,7 +85,7 @@ def vectorize(features):
 
 # ------------------------------------------------------------ collecting
 
-def log_candidates(candidates, evidence_map, plan, video_duration, query, survivors):
+def log_candidates(candidates, evidence_map, plan, video_duration, query, survivors, search_seconds=None):
     """Record which candidates actually yielded a confirmed match, for later training.
 
     Every row of one search shares a `search` id, because ranking is a per-search problem:
@@ -111,6 +111,10 @@ def log_candidates(candidates, evidence_map, plan, video_duration, query, surviv
                 # probability that brought them here rather than treat them as ordinary rows.
                 "explored": bool(candidate.get("explored", False)),
                 "propensity": float(candidate.get("propensity", 1.0)),
+                # What verifying this candidate cost, and the whole search's verification, so a
+                # replay can charge a policy for the calls it makes (see bench.replay).
+                "verify_seconds": candidate.get("verify_seconds"),
+                "search_seconds": search_seconds,
                 "features": features,
             }) + "\n")
 

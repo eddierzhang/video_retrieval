@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
+from bench.tracking import Run, seed_everything
 from video_retrieval.learning import ADAPTER_MODEL
 from video_retrieval.local_backend import encode, frame_embeddings
 from webapp.library import Library
@@ -273,8 +274,16 @@ def main():
     parser.add_argument("--mask-iou", type=float, default=0.25)
     parser.add_argument("--out", default=str(ADAPTER_MODEL))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    seed_everything(args.seed)
+    with Run("adapt", args, seed=args.seed) as run:
+        print(f"run {run.id}")
+        adapt(args, run)
+
+
+def adapt(args, run):
     sources = tuple(name.strip() for name in args.sources.split(",") if name.strip())
     unknown = set(sources) - set(SOURCES)
     if unknown:
@@ -294,13 +303,14 @@ def main():
 
     # Spans are held out, but the gallery a held-out text is ranked against stays the whole
     # video - that is what search does, and a six-span gallery would flatter any adapter.
-    train_spans, holdout_spans = split_groups(groups, by=args.split)
+    train_spans, holdout_spans = split_groups(groups, by=args.split, seed=args.seed)
     held_texts = np.flatnonzero(holdout_spans[text_groups])
     if holdout_spans.sum() < 3 or len(held_texts) < 20:
         raise SystemExit("Too few spans to hold any out. Index more video first.")
     before = evaluate(text_vectors[held_texts], text_groups[held_texts], groups, mask[held_texts])
     print(f"holdout: {len(held_texts)} texts, ranked against every span of their own video")
     show("identity", before)
+    run.summarize(texts=len(texts), spans=len(groups), sources=list(sources), identity=before)
     if not before["texts"]:
         raise SystemExit("No video has enough spans to evaluate against. Index a longer video first.")
     if args.dry_run:
@@ -333,7 +343,7 @@ def main():
     identity = torch.eye(dimensions, device=device)
     optimizer = torch.optim.Adam([left, right], lr=1e-3, weight_decay=1e-4)
     scale = 20.0
-    random = np.random.RandomState(0)
+    random = np.random.RandomState(args.seed)
     names = sorted(videos)
     sizes = np.array([len(videos[name]) for name in names], dtype=np.float64)
 
@@ -368,6 +378,7 @@ def main():
 
     show("identity", before)
     show("adapter", best)
+    run.summarize(adapter=best)
     if best["recall@1"] <= before["recall@1"] and best["recall@5"] <= before["recall@5"]:
         print("The adapter did not beat the identity on held-out spans, so it is not being saved.")
         print("Index more video and try again; with this little data that is the expected outcome.")
@@ -379,6 +390,7 @@ def main():
              recall1_before=before["recall@1"], recall1_after=best["recall@1"],
              recall5_before=before["recall@5"], recall5_after=best["recall@5"])
     print("written to", args.out)
+    run.artifact(args.out, "query_adapter")
     print("Then check it end to end: python -m bench.run --compare bench/results/<an earlier run>")
 
 

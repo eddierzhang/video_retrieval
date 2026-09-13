@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any
 
-from . import learning, local_backend
+from . import boundaries, learning, local_backend
 from .local_backend import LocalModels, use_models
 from .retrieval import (
     apply_temporal_ordering,
@@ -87,6 +88,7 @@ def retrieve_video(
     verifier_overlap_seconds=5.0,
     refine_boundaries=True,
     refinement_stages=(8.0, 4.0, 2.0),
+    learned_boundaries=None,
     nms_iou_threshold=0.55,
     final_frame_fps=4.0,
     max_frames_per_match=None,
@@ -252,6 +254,7 @@ def retrieve_video(
             diagnostics["prefilter"] = selection
 
         # 6. First vision-model pass finds every occurrence inside each candidate
+        verification_started = time.perf_counter()
         local_backend.stage("Verifying candidates with the vision model")
         instances = verify_candidates_flash(
             manifest,
@@ -295,6 +298,7 @@ def retrieve_video(
                 plan=plan,
                 stages=refinement_stages,
             )
+        diagnostics["verification_seconds"] = round(time.perf_counter() - verification_started, 3)
     else:
         # Retrieval-only search: rank evidence candidates without vision-model checks.
         instances = [
@@ -315,6 +319,15 @@ def retrieve_video(
         iou_threshold=nms_iou_threshold,
         preserve_distinct_actors=True,
     )
+
+    # A trained boundary model tightens retrieval's padded regions from the frame embeddings.
+    # By default only in quick mode: verified mode has already spent vision calls on this.
+    if learned_boundaries is None:
+        learned_boundaries = not run_verification
+    if learned_boundaries and instances:
+        instances, boundary_info = boundaries.refine_instances(manifest, query, instances)
+        if boundary_info:
+            diagnostics["learned_boundaries"] = boundary_info
 
     # For a normal singular query, only now select the best final event.
     if return_mode == "best" and instances:
@@ -338,6 +351,7 @@ def retrieve_video(
         learning.log_candidates(
             candidates, evidence_map, plan, manifest["video"]["duration"], query,
             [match.get("source_candidate_id") for match in matches],
+            search_seconds=diagnostics.get("verification_seconds"),
         )
 
     result = {

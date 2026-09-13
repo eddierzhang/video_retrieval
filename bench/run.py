@@ -23,6 +23,7 @@ import statistics
 import tempfile
 import time
 
+from bench.tracking import Run
 from video_retrieval.local_backend import LocalModels
 from video_retrieval.local_indexing import IndexVersionMismatch, load_index
 from webapp.library import Library
@@ -165,8 +166,16 @@ def main():
     parser.add_argument("--mode", choices=("verified", "quick"), help="override the mode of every row")
     parser.add_argument("--out", help="where to write the result JSON")
     parser.add_argument("--compare", help="an earlier result file to diff against")
+    parser.add_argument("--seed", type=int, default=0, help="which subset --sample draws")
     args = parser.parse_args()
 
+    with Run("benchmark", args, seed=args.seed) as run:
+        print(f"run {run.id}")
+        benchmark(args, run)
+
+
+def benchmark(args, run):
+    run.input(args.dataset)
     dataset = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
     rows = [row for row in dataset["rows"] if not args.only or row["id"] in args.only]
     if args.video:
@@ -174,11 +183,12 @@ def main():
     if not rows:
         raise SystemExit("No rows selected.")
     if args.sample and args.sample < len(rows):
-        rows = random.Random(0).sample(rows, args.sample)
+        rows = random.Random(args.seed).sample(rows, args.sample)
     if args.mode:
         rows = [{**row, "mode": args.mode} for row in rows]
 
     models = LocalModels()
+    run.note(models=models.signature(), rows_selected=[row["id"] for row in rows])
     pipelines = load_pipelines(rows, Library(), models)
     measured, failed = [], []
     with tempfile.TemporaryDirectory() as temp:
@@ -190,8 +200,10 @@ def main():
                 # reason to throw away every row after it - these runs take hours.
                 failed.append({"id": row["id"], "error": f"{type(exc).__name__}: {exc}"})
                 print(f"[fail] {row['id']:<18} {type(exc).__name__}: {exc}", flush=True)
+                run.log({"id": row["id"], "failed": failed[-1]["error"]})
                 continue
             print(format_row(measured[-1]), flush=True)
+            run.log(measured[-1])
 
     result = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -209,6 +221,8 @@ def main():
     out = Path(args.out) if args.out else RESULTS / f"{datetime.now():%Y%m%d-%H%M%S}.json"
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print("written to", out)
+    run.artifact(out, "benchmark_result")
+    run.summarize(**result["summary"], failed=len(failed))
     if args.compare:
         compare(result, args.compare)
 
