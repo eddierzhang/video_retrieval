@@ -1,14 +1,20 @@
 #Pipeline for video retrieval
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import lru_cache
+import json
+from pathlib import Path
 import time
 from typing import Any
 
 from . import boundaries, learning, local_backend
+from .config import DATA_DIR
 from .local_backend import LocalModels, use_models
 from .retrieval import (
     apply_temporal_ordering,
+    scoring_override,
     build_temporal_evidence_map,
     candidates_from_evidence_map,
     cluster_fused_results,
@@ -55,10 +61,140 @@ class VideoRetrievalPipeline:
 
     def retrieve(self, query: str, reporter=None, cancel_event=None, **kwargs):
         models = self.resources.local_models or LocalModels()
-        with use_models(models, reporter, cancel_event):
+        # Settings tuned by bench.tune apply only in the mode they were tuned for: padding that
+        # suits a quick answer could starve the verifier of context. Explicit arguments still win.
+        tuned = load_tuned_settings()
+        mode = "verified" if kwargs.get("run_verification", True) else "quick"
+        applies = bool(tuned) and tuned.get("mode") == mode
+        if applies:
+            kwargs = {**(tuned.get("pipeline") or {}), **kwargs}
+        scored = scoring_override(tuned.get("scoring")) if applies else nullcontext()
+        with use_models(models, reporter, cancel_event), scored:
             result = retrieve_video(query=query, resources=self.resources, **kwargs)
         result["model_backend"] = models.signature()
+        if applies:
+            result["tuned_settings"] = tuned.get("run")
         return result
+
+
+TUNED_SETTINGS = DATA_DIR / "learning" / "retrieval_settings.json"
+
+
+@lru_cache(maxsize=2)
+def _read_settings(path, stamp):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def load_tuned_settings(path=TUNED_SETTINGS):
+    """Retrieval settings found by bench.tune, or None when nothing has been tuned."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        return _read_settings(str(path), path.stat().st_mtime_ns)
+    except (OSError, ValueError):
+        return None
+
+def locate_candidates(
+    retrieval_results,
+    plan,
+    video_duration,
+    fusion_bin_size=5,
+    evidence_bin_size=2.0,
+    evidence_smoothing_bins=1,
+    candidate_max_gap=10,
+    candidate_padding=10,
+    candidate_relative_score_floor=None,
+    max_candidates=None,
+    recursive_candidate_search=True,
+    recursive_search_depth=3,
+    recursive_shrink_factor=0.50,
+    recursive_child_overlap=0.50,
+    recursive_child_relative_score_floor=0.60,
+    recursive_max_children_per_candidate=2,
+    recursive_min_window_seconds=12.0,
+    recursive_context_padding=4.0,
+):
+    """Retrieval hits to ranked candidate windows, with no model calls."""
+    fused = fuse_retrieval_results(retrieval_results, plan, bin_size=fusion_bin_size)
+    evidence_map = build_temporal_evidence_map(
+        retrieval_results,
+        plan,
+        video_duration=video_duration,
+        bin_size=evidence_bin_size,
+        smoothing_bins=evidence_smoothing_bins,
+    )
+    evidence_peak = max((float(row.get("score", 0.0)) for row in evidence_map), default=0.0)
+    located = {"fused": fused, "evidence_map": evidence_map, "evidence_peak": evidence_peak,
+               "initial_candidates": [], "candidates": [], "empty": evidence_peak <= 0 and not fused}
+    if located["empty"]:
+        return located
+
+    return_mode = plan.get("return_mode", "all")
+    if candidate_relative_score_floor is None:
+        candidate_relative_score_floor = 0.05 if return_mode == "all" else 0.15
+
+    # 4. Candidate Generation
+    if evidence_peak > 0:
+        initial_candidates = candidates_from_evidence_map(
+            evidence_map,
+            max_gap=candidate_max_gap,
+            padding=candidate_padding,
+            video_duration=video_duration,
+            relative_score_floor=candidate_relative_score_floor,
+        )
+    else:
+        # Defensive compatibility fallback for unusual legacy retrieval outputs.
+        initial_candidates = cluster_fused_results(
+            fused,
+            bin_size=fusion_bin_size,
+            max_gap=candidate_max_gap,
+            padding=candidate_padding,
+            video_duration=video_duration,
+            relative_score_floor=candidate_relative_score_floor,
+        )
+
+    # 5. Recursive Evidence Search
+    if recursive_candidate_search and evidence_peak > 0:
+        candidates = recursive_refine_candidates(
+            evidence_map,
+            initial_candidates,
+            plan=plan,
+            max_depth=recursive_search_depth,
+            shrink_factor=recursive_shrink_factor,
+            child_overlap=recursive_child_overlap,
+            child_relative_score_floor=recursive_child_relative_score_floor,
+            max_children_per_node=recursive_max_children_per_candidate,
+            min_window_seconds=recursive_min_window_seconds,
+            context_padding=recursive_context_padding,
+            video_duration=video_duration,
+            return_mode=return_mode,
+        )
+    else:
+        candidates = initial_candidates
+
+    # Ordering constraints only make sense once candidate windows exist.
+    candidates = apply_temporal_ordering(candidates, retrieval_results, plan)
+    if max_candidates is not None:
+        candidates = candidates[:max_candidates]
+    located.update(initial_candidates=initial_candidates, candidates=candidates)
+    return located
+
+
+def retrieval_instances(candidates):
+    """Candidates as unverified answers, the way quick mode returns them."""
+    return [
+        {
+            "start": float(candidate["start"]),
+            "end": float(candidate["end"]),
+            "confidence": float(candidate.get("score", 0.0)),
+            "description": "Candidate moment ranked by retrieval evidence (not verified)",
+            "source_candidate_id": candidate.get("candidate_id"),
+            "retrieval_score": float(candidate.get("score", 0.0)),
+        }
+        for candidate in candidates
+    ]
+
 
 #Method to retrieve the actual video. Each final match contains precise timestamps, a matching clip, and matching frame paths extracted from the original source video.
 def retrieve_video(
@@ -158,81 +294,28 @@ def retrieve_video(
         top_k=retrieval_top_k,
     )
 
-    # 3. Temporal Evidence/Possible Occurence Map
+    # 3-5. Evidence map, candidate windows, recursive refinement and ordering. None of it calls a
+    # model, which is what lets bench.tune replay this stage under many settings.
     local_backend.stage("Building evidence timeline")
-    fused = fuse_retrieval_results(
-        retrieval_results,
-        plan,
-        bin_size=fusion_bin_size,
+    located = locate_candidates(
+        retrieval_results, plan, manifest["video"]["duration"],
+        fusion_bin_size=fusion_bin_size, evidence_bin_size=evidence_bin_size,
+        evidence_smoothing_bins=evidence_smoothing_bins, candidate_max_gap=candidate_max_gap,
+        candidate_padding=candidate_padding, candidate_relative_score_floor=candidate_relative_score_floor,
+        max_candidates=max_candidates, recursive_candidate_search=recursive_candidate_search,
+        recursive_search_depth=recursive_search_depth, recursive_shrink_factor=recursive_shrink_factor,
+        recursive_child_overlap=recursive_child_overlap,
+        recursive_child_relative_score_floor=recursive_child_relative_score_floor,
+        recursive_max_children_per_candidate=recursive_max_children_per_candidate,
+        recursive_min_window_seconds=recursive_min_window_seconds,
+        recursive_context_padding=recursive_context_padding,
     )
-
-    evidence_map = build_temporal_evidence_map(
-        retrieval_results,
-        plan,
-        video_duration=manifest["video"]["duration"],
-        bin_size=evidence_bin_size,
-        smoothing_bins=evidence_smoothing_bins,
-    )
-    evidence_peak = max(
-        (float(row.get("score", 0.0)) for row in evidence_map),
-        default=0.0,
-    )
-
-    if evidence_peak <= 0 and not fused:
-        return {
-            "query": query,
-            "plan": plan,
-            "num_matches": 0,
-            "matches": [],
-        }
+    if located["empty"]:
+        return {"query": query, "plan": plan, "num_matches": 0, "matches": []}
     local_backend.stage("Finding candidate moments")
-    if candidate_relative_score_floor is None:
-        candidate_relative_score_floor = 0.05 if return_mode == "all" else 0.15
-
-    # 4. Candidate Generation 
-    if evidence_peak > 0:
-        initial_candidates = candidates_from_evidence_map(
-            evidence_map,
-            max_gap=candidate_max_gap,
-            padding=candidate_padding,
-            video_duration=manifest["video"]["duration"],
-            relative_score_floor=candidate_relative_score_floor,
-        )
-    else:
-        # Defensive compatibility fallback for unusual legacy retrieval outputs.
-        initial_candidates = cluster_fused_results(
-            fused,
-            bin_size=fusion_bin_size,
-            max_gap=candidate_max_gap,
-            padding=candidate_padding,
-            video_duration=manifest["video"]["duration"],
-            relative_score_floor=candidate_relative_score_floor,
-        )
-
-    # 5. Recursive Evidence Search 
-    if recursive_candidate_search and evidence_peak > 0:
-        candidates = recursive_refine_candidates(
-            evidence_map,
-            initial_candidates,
-            plan=plan,
-            max_depth=recursive_search_depth,
-            shrink_factor=recursive_shrink_factor,
-            child_overlap=recursive_child_overlap,
-            child_relative_score_floor=recursive_child_relative_score_floor,
-            max_children_per_node=recursive_max_children_per_candidate,
-            min_window_seconds=recursive_min_window_seconds,
-            context_padding=recursive_context_padding,
-            video_duration=manifest["video"]["duration"],
-            return_mode=return_mode,
-        )
-    else:
-        candidates = initial_candidates
-
-    # Ordering constraints only make sense once candidate windows exist.
-    candidates = apply_temporal_ordering(candidates, retrieval_results, plan)
-
-    if max_candidates is not None:
-        candidates = candidates[:max_candidates]
+    fused, evidence_map = located["fused"], located["evidence_map"]
+    evidence_peak = located["evidence_peak"]
+    initial_candidates, candidates = located["initial_candidates"], located["candidates"]
 
     
     diagnostics = {
@@ -301,17 +384,7 @@ def retrieve_video(
         diagnostics["verification_seconds"] = round(time.perf_counter() - verification_started, 3)
     else:
         # Retrieval-only search: rank evidence candidates without vision-model checks.
-        instances = [
-            {
-                "start": float(candidate["start"]),
-                "end": float(candidate["end"]),
-                "confidence": float(candidate.get("score", 0.0)),
-                "description": "Candidate moment ranked by retrieval evidence (not verified)",
-                "source_candidate_id": candidate.get("candidate_id"),
-                "retrieval_score": float(candidate.get("score", 0.0)),
-            }
-            for candidate in candidates
-        ]
+        instances = retrieval_instances(candidates)
 
     # 9. Temporal NMS / overlap deduplication
     instances = temporal_nms(

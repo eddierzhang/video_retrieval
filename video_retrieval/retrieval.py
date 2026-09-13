@@ -1,16 +1,47 @@
 #Query planning, multimodal retrieval, fusion, and initial candidate clustering.
 from __future__ import annotations
 
-# How hard planner-supplied confounders push an interval down, and how much a
-# satisfied or violated ordering constraint moves a candidate.
-NEGATIVE_EVIDENCE_WEIGHT = 0.5
-ORDERING_SATISFIED_BOOST = 1.15
-ORDERING_VIOLATED_PENALTY = 0.75
+from contextlib import contextmanager
+import json
+import math
 
 from . import local_backend
 
-import json
-import math
+# The hand-picked numbers that decide which moment wins. bench.tune searches them against
+# benchmark rows whose answers are known; a search wraps itself in scoring_override() to use a
+# tuned set, and everything else sees these defaults.
+DEFAULT_SCORING = {
+    # How hard a planner-supplied confounder pushes its bins down.
+    "negative_evidence_weight": 0.5,
+    # How much a satisfied or violated ordering constraint moves a candidate.
+    "ordering_satisfied_boost": 1.15,
+    "ordering_violated_penalty": 0.75,
+    # An atomic predicate counts for floor + (1 - floor) * importance of a full-query hit.
+    "predicate_floor": 0.55,
+    # A channel's map per bin: this share from its strongest query, the rest from their mean.
+    "peak_share": 0.80,
+    # A window's score: its peak bin, the mean of its top quarter, and its overall mean.
+    "window_peak": 0.55,
+    "window_top_mean": 0.35,
+    "window_mean": 0.10,
+}
+_scoring_override = None
+
+
+def scoring():
+    return {**DEFAULT_SCORING, **(_scoring_override or {})}
+
+
+@contextmanager
+def scoring_override(values):
+    """Score with `values` in place of the defaults for the duration of the block."""
+    global _scoring_override
+    previous = _scoring_override
+    _scoring_override = {key: float(value) for key, value in (values or {}).items() if key in DEFAULT_SCORING}
+    try:
+        yield
+    finally:
+        _scoring_override = previous
 
 from .embeddings import search_video
 from .metadata import search_metadata
@@ -896,6 +927,9 @@ def build_temporal_evidence_map(
     mapped = channels + ["negative"]
     channel_maps = {channel: [0.0] * n_bins for channel in mapped}
     channel_support = {channel: [0] * n_bins for channel in mapped}
+    weights_used = scoring()
+    predicate_floor = weights_used["predicate_floor"]
+    peak_share = weights_used["peak_share"]
 
     for channel in mapped:
         query_maps = []
@@ -925,7 +959,7 @@ def build_temporal_evidence_map(
                 # Atomic cues should influence retrieval without overwhelming the
                 # original full-query searches. Required/high-importance predicates
                 # naturally receive more weight.
-                predicate_factor = 0.55 + 0.45 * importance
+                predicate_factor = predicate_floor + (1.0 - predicate_floor) * importance
                 score = max(0.0, min(1.0, base_score * predicate_factor))
 
                 first_bin = max(0, int(start // bin_size))
@@ -957,7 +991,7 @@ def build_temporal_evidence_map(
             mean = sum(scores) / len(scores)
             # A single strong atomic predicate can surface a candidate, while
             # agreement across predicates gives it a modest support boost.
-            channel_maps[channel][i] = 0.80 * peak + 0.20 * mean
+            channel_maps[channel][i] = peak_share * peak + (1.0 - peak_share) * mean
             channel_support[channel][i] = sum(1 for qmap in query_maps if qmap[i] > 0.05)
 
         channel_maps[channel] = _smooth_series(
@@ -972,7 +1006,7 @@ def build_temporal_evidence_map(
         for channel in channels:
             score += max(0.0, float(weights.get(channel, 0.0))) * channel_maps[channel][i]
         # A confounder pulls its bin down; it can never push the score below zero.
-        score -= NEGATIVE_EVIDENCE_WEIGHT * channel_maps["negative"][i]
+        score -= weights_used["negative_evidence_weight"] * channel_maps["negative"][i]
         total_scores[i] = max(0.0, min(1.0, score))
 
     evidence_map = []
@@ -1078,7 +1112,9 @@ def _window_evidence_score(evidence_map, start, end):
     top_n = max(1, int(math.ceil(len(scores) * 0.25)))
     top_mean = sum(scores[:top_n]) / top_n
     mean = sum(scores) / len(scores)
-    score = 0.55 * peak + 0.35 * top_mean + 0.10 * mean
+    weights_used = scoring()
+    score = (weights_used["window_peak"] * peak + weights_used["window_top_mean"] * top_mean
+             + weights_used["window_mean"] * mean)
     return score, len(rows), [int(row["bin_id"]) for row in rows]
 
 #Generates smaller overlapping windows from one larger window
@@ -1299,7 +1335,9 @@ def apply_temporal_ordering(candidates, retrieval_results, plan):
             else:
                 violated += 1
         if satisfied or violated:
-            factor = (ORDERING_SATISFIED_BOOST ** satisfied) * (ORDERING_VIOLATED_PENALTY ** violated)
+            weights_used = scoring()
+            factor = ((weights_used["ordering_satisfied_boost"] ** satisfied)
+                      * (weights_used["ordering_violated_penalty"] ** violated))
             row["score"] = float(row.get("score", 0.0)) * factor
             row["ordering_satisfied"] = satisfied
             row["ordering_violated"] = violated

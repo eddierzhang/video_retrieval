@@ -75,7 +75,9 @@ def run_row(pipeline, row, output_root):
         final_frame_fps=1.0,
         max_frames_per_match=1,
     )
-    matches = result.get("matches", [])
+    # Matches come back in time order. "Top 1" has to mean the one the system trusts most, not the
+    # earliest, or a correct but late answer is scored as a rank-2 miss.
+    matches = sorted(result.get("matches", []), key=lambda match: -float(match.get("confidence", 0.0)))
     measured = {
         "id": row["id"],
         "video": row["video"],

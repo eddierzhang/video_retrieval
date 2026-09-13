@@ -3,6 +3,7 @@
     python -m bench.construct                    build timelines and write bench/constructed.json
     python -m bench.construct --ingest           also add them to the library and index them
     python -m bench.construct --timelines 4 --segments 5 --seed 2
+    python -m bench.construct --append --timelines 7 --ingest   add seven more to the existing set
     python -m bench.run --dataset bench/constructed.json --mode quick
 
 Every other label in this project traces back to the vision model: synthetic queries are its
@@ -26,7 +27,7 @@ Two things the edit list cannot make exact, and which the rows say out loud:
                  recorded as `confusable_with`, so a miss on one of them can be read for what it is.
 
 Constructed boundaries fall on hard cuts, which real events do not. A method that snaps to cuts
-will look better here than it is on real footage - see bench.boundaries --no-cuts.
+will look better here than it is on real footage - see bench.boundaries, which saves the model without cut features for that reason.
 """
 from __future__ import annotations
 
@@ -287,6 +288,8 @@ def main():
     parser.add_argument("--max-similarity", type=float, default=0.35,
                         help="how alike two chunks from one video may be, by what the scene model listed")
     parser.add_argument("--ingest", action="store_true", help="add to the library and index (slow)")
+    parser.add_argument("--append", action="store_true",
+                        help="keep the timelines already in --out and add --timelines more after them")
     parser.add_argument("--out", default=str(DATASET))
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -305,10 +308,23 @@ def main():
             print("No usable font found, so no text rows will be drawn.")
 
         timelines, rows = [], []
-        for number in range(1, args.timelines + 1):
+        if args.append and Path(args.out).is_file():
+            # Existing timelines are already indexed; rebuilding them would re-encode different bytes
+            # and put a second copy in the library under the same name.
+            existing = json.loads(Path(args.out).read_text(encoding="utf-8"))
+            timelines, rows = existing.get("timelines", []), existing.get("rows", [])
+            print(f"keeping {len(timelines)} existing timelines and {len(rows)} rows")
+        first = max((timeline["number"] for timeline in timelines), default=0) + 1
+        built = []
+        for number in range(first, first + args.timelines):
             print(f"\ntimeline {number}")
+            if args.append:
+                # Each appended timeline draws from its own stream, so which ones already exist
+                # does not change what a given number contains.
+                rng = random.Random(f"{args.seed}:{number}")
             timeline, timeline_rows = build_timeline(number, pool, args, rng, font)
             timelines.append(timeline)
+            built.append(timeline)
             rows.extend(timeline_rows)
             run.log({"timeline": number, "segments": len(timeline["segments"]), "rows": len(timeline_rows),
                      "duration": timeline["duration"]})
@@ -337,7 +353,7 @@ def main():
 
             print("\nindexing - this runs the vision model over every timeline")
             models = LocalModels()
-            for timeline in timelines:
+            for timeline in built:
                 record = ingest_and_index(Path(timeline["file"]), timeline["name"], library, models)
                 if record["name"] != timeline["name"]:
                     # Identical bytes were already in the library under another name.
