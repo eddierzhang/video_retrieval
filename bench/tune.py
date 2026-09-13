@@ -20,7 +20,8 @@ Twenty settings and a few dozen rows is a recipe for fitting the benchmark inste
                      the other timelines and scored on its own. The number that decides anything
                      is the held-out one.
   a gate             settings are saved only if, across folds, they beat the defaults on
-                     timelines they never saw.
+                     timelines they never saw - and no event-length bucket loses more than
+                     --max-bucket-loss, because an average once hid a length it made worse.
   one mode           they are tuned for quick mode and only ever applied to quick searches.
 
 The cache is keyed by the query, the video's index, the planner model and the planner's own
@@ -300,6 +301,8 @@ def main():
     parser.add_argument("--trials", type=int, default=200, help="random settings tried per search")
     parser.add_argument("--refine", type=int, default=100, help="hill-climbing steps after that")
     parser.add_argument("--folds", type=int, default=5, help="cross-validation folds, by timeline")
+    parser.add_argument("--max-bucket-loss", type=float, default=0.05,
+                        help="most held-out IoU any event-length bucket may lose for settings to be saved")
     parser.add_argument("--no-boundaries", action="store_true", help="tune without the learned boundary model")
     parser.add_argument("--out", default=str(TUNED_SETTINGS))
     parser.add_argument("--dry-run", action="store_true")
@@ -363,11 +366,15 @@ def main():
         print(f"\ncross-validation: {len(folds)} folds by timeline, "
               f"{args.trials} random + {args.refine} refining trials each")
         held_default, held_tuned = [], []
+        held_default_rows, held_tuned_rows = [], []
         for number, held in enumerate(folds, 1):
             fit = [row for row in rows if row not in held]
             settings, fit_score = search(fit, args.trials, args.refine, rng, boundary_model)
-            before = evaluate(held, defaults(), boundary_model)
-            after = evaluate(held, settings, boundary_model)
+            default_scored = row_scores(held, defaults(), boundary_model)
+            tuned_scored = row_scores(held, settings, boundary_model)
+            held_default_rows.extend(default_scored)
+            held_tuned_rows.extend(tuned_scored)
+            before, after = summarise(default_scored), summarise(tuned_scored)
             held_default.append((before["top1_iou"], len(held)))
             held_tuned.append((after["top1_iou"], len(held)))
             print(f"   fold {number}: {len(fit)} fit / {len(held)} held out   fit top-1 {fit_score:.3f}   "
@@ -382,6 +389,12 @@ def main():
         print(f"\nheld-out top-1 IoU across folds: defaults {cv_default:.3f}   tuned {cv_tuned:.3f}   "
               f"({cv_tuned - cv_default:+.3f}; better in {wins} of {len(folds)} folds)")
         run.summarize(cv_default_top1=cv_default, cv_tuned_top1=cv_tuned, folds_improved=wins, folds=len(folds))
+        # An average can hide a length it made worse, which is what happened the first time.
+        bucket_before, bucket_after = print_duration_table(
+            "held-out top-1 IoU by length of the true event", held_default_rows, held_tuned_rows)
+        worst = min((bucket_after[label]["top1_iou"] - bucket_before[label]["top1_iou"], label)
+                    for label in bucket_before)
+        run.summarize(cv_by_duration={"defaults": bucket_before, "tuned": bucket_after}, worst_bucket=worst)
 
         print("\nfinal search on every row")
         settings, full_score = search(rows, args.trials, args.refine, rng, boundary_model,
@@ -403,13 +416,19 @@ def main():
                   "so nothing is saved.")
             run.summarize(saved=False)
             return
+        if worst[0] < -args.max_bucket_loss:
+            print(f"\nTuned settings lose {-worst[0]:.3f} IoU on {worst[1]} events held out, more than the "
+                  f"{args.max_bucket_loss:.2f} allowed, so nothing is saved.")
+            run.summarize(saved=False)
+            return
         document = {
             "mode": "quick",
             "trained_at": datetime.now().isoformat(timespec="seconds"),
             "run": run.id,
             "rows": len(rows),
             "boundaries": bool(boundary_model),
-            "metrics": {"cv_default_top1": cv_default, "cv_tuned_top1": cv_tuned, "folds_improved": wins,
+            "metrics": {"cv_by_duration": {"defaults": bucket_before, "tuned": bucket_after},
+                        "cv_default_top1": cv_default, "cv_tuned_top1": cv_tuned, "folds_improved": wins,
                         "folds": len(folds), "defaults_all_rows": default_score, "tuned_all_rows": final},
             "pipeline": settings["pipeline"],
             "scoring": settings["scoring"],
