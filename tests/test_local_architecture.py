@@ -397,6 +397,42 @@ class LocalArchitectureTest(unittest.TestCase):
         self.assertRegex(code, r"^[A-Z]{3}-[0-9]{4}$")
         self.assertFalse(set(code) & set("OI0158SB"))  # no glyphs a reader could honestly confuse
 
+    def test_optimal_stopping_is_actually_optimal(self):
+        from bench.replay import continuation_value
+
+        generator = np.random.RandomState(0)
+        for _ in range(300):
+            count = int(generator.randint(1, 7))
+            probabilities = np.sort(generator.uniform(0, 1, count))[::-1]
+            costs = generator.uniform(1, 40, count)
+            value = float(generator.uniform(5, 150))
+            gains = probabilities * value - costs
+            # Every stopping rule here is "verify the first k" (plus "stop at a hit" when only the
+            # first match counts), so brute force is the best such k.
+            every = max(0.0, max(np.cumsum(gains)))
+            reach = np.concatenate([[1.0], np.cumprod(1.0 - probabilities)[:-1]])
+            first = max(0.0, max(np.cumsum(reach * gains)))
+            self.assertAlmostEqual(continuation_value(probabilities, costs, value, "all", 0), every, places=6)
+            self.assertAlmostEqual(continuation_value(probabilities, costs, value, "first", 0), first, places=6)
+
+    def test_replay_charges_what_a_policy_verifies_and_hides_outcomes(self):
+        from bench.replay import replay
+
+        group = {"labels": np.array([0.0, 1.0, 1.0, 0.0]), "costs": np.array([5.0, 7.0, 11.0, 13.0]),
+                 "features": np.zeros((4, 3))}
+        probability_of = lambda group: np.array([0.9, 0.2, 0.8, 0.1])  # order: 0, 2, 1, 3
+
+        def two_then_stop(context):
+            self.assertNotIn("labels", context)  # a live policy cannot see what it is deciding about
+            return context["position"] < 2
+
+        result = replay(group, two_then_stop, probability_of, value=100.0, goal="all")
+        self.assertEqual((result["calls"], result["seconds"], result["found"]), (2, 16.0, 1))
+        self.assertAlmostEqual(result["reward"], 100.0 - 16.0)
+        first = replay(group, lambda context: True, probability_of, value=100.0, goal="first")
+        self.assertEqual(first["found"], 2)
+        self.assertAlmostEqual(first["reward"], 100.0 - 36.0)  # only the first hit is paid for
+
     def _rejecting_ranker(self):
         from video_retrieval import learning
 
