@@ -9,11 +9,45 @@ ORDERING_VIOLATED_PENALTY = 0.75
 
 from . import local_backend
 
+import json
 import math
 
 from .embeddings import search_video
 from .metadata import search_metadata
 from .transcript import search_transcript_bm25, search_transcript_semantic
+
+TEXT_ROUTE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "stated_text": {"type": "string"},
+        "asks_for_unknown_text": {"type": "boolean"},
+    },
+    "required": ["stated_text", "asks_for_unknown_text"],
+    "additionalProperties": False,
+}
+
+
+def confirm_text_route(query):
+    """One narrow question: must characters be read OUT of the video, or did the user write them?
+
+    A request that states its text ("a banner reading Happy Birthday") already knows it and is
+    asking for the moment; one that asks what the text is ("what does the banner say") is not.
+    """
+    prompt = f"""A user typed this request to search inside a video:
+
+{query}
+
+First copy any words the user themselves wrote as text that appears in the video - the words on
+a sign, banner, poster, jersey, slide or screen - into stated_text, or leave it empty.
+
+Then answer asks_for_unknown_text: is the user asking the system to READ characters they do not
+already know ("what does it say", "read the code", "which number", "what is the price")?
+- If the user already wrote the words, they know them: false.
+- If the request just describes a scene or an object, even one with writing on it: false.
+- Only true when the answer the user wants back is a string of characters from the video."""
+    answer = local_backend.chat_json(prompt, TEXT_ROUTE_SCHEMA, role="planner")
+    return {"stated_text": str(answer.get("stated_text", "")).strip(),
+            "asks_for_unknown_text": bool(answer.get("asks_for_unknown_text", True))}
 
 #Turns natural language query into a structured prompt
 def plan_query(query):
@@ -50,6 +84,19 @@ text happens to be on screen:
   even when the frame is full of writing. Screens, code editors, slides, menus,
   documents and signs are ordinary scenery when the request is about an action.
 
+THE DECISIVE TEST - does the user already know the text?
+- If the prompt STATES the words ("NY", "Thanks For Watching", "a poster titled
+  HAB", "a sign that says hello", "number 10"), the user cannot be asking what
+  those words are - they already wrote them. They want the MOMENT the text
+  appears: use temporal_grounding. The quoted words are just a way of describing
+  the scene, and temporal_grounding already searches visible text through its
+  scene descriptions.
+- Only when the characters are UNKNOWN to the user and must be read out of the
+  video ("what does it say", "read the code", "which number", "what is the
+  price") is the answer a string: use visual_text_extraction.
+- A prompt that is just a description of a scene - with no question and no
+  instruction to read - is asking for the moment that matches it.
+
 EXAMPLES, including pairs that differ only in what is being asked:
 - "read the file name shown in the editor tab" -> visual_text_extraction.
 - "scrolling through code in an editor" -> temporal_grounding: the answer is when
@@ -61,8 +108,14 @@ EXAMPLES, including pairs that differ only in what is being asked:
 - "model airplanes in a display case" -> temporal_grounding: these are objects to
   find, and nothing has to be read.
 - "what is the price on the menu board" -> visual_text_extraction.
-- "find the player wearing number 10" -> visual_text_extraction, because the
-  printed number decides the match.
+- "find the player wearing number 10" -> temporal_grounding: the user already knows
+  the number and wants the moments that player appears.
+- "what number is on the jersey of the player who scores" -> visual_text_extraction:
+  now the number is the unknown answer.
+- "tennis court with NY text on the wall" -> temporal_grounding: a scene
+  description; "NY" is stated, not asked for.
+- "the title card that says Thanks For Watching" -> temporal_grounding.
+- "what does the title card at the end say" -> visual_text_extraction.
 - "when does she say thank you" -> temporal_grounding, because the words are
   spoken rather than printed in the frame.
 - The user must NOT need to say "OCR". Infer it from the answer they want.
@@ -331,6 +384,19 @@ General planning rules:
     }
 
     plan = local_backend.chat_json(prompt + "\nPlan only this user request: " + query, schema, role="planner")
+
+    # Sending a moment to the text reader is the costliest routing mistake - a minute or more
+    # of OCR that comes back empty - and the planner makes it whenever a scene is described by
+    # its text. So a text route is checked with one narrow question before it is trusted.
+    if plan.get("executor") == "visual_text_extraction":
+        check = confirm_text_route(query)
+        if not check["asks_for_unknown_text"]:
+            forced = json.loads(json.dumps(schema))
+            forced["properties"]["executor"]["enum"] = ["temporal_grounding"]
+            plan = local_backend.chat_json(
+                prompt + "\nThe user already states the text, so this request is for a MOMENT."
+                "\nPlan only this user request: " + query, forced, role="planner")
+            plan["rerouted"] = {"from": "visual_text_extraction", "stated_text": check["stated_text"]}
 
     #Type of query
     if plan.get("executor") == "visual_text_extraction":

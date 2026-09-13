@@ -1,0 +1,194 @@
+{
+  "about": [
+    "Queries labeled with the executor that should answer them. The label is the kind of answer",
+    "wanted: characters to read back (visual_text_extraction) or a moment (temporal_grounding).",
+    "The hard cases are moments described by text that happens to be on screen - the three",
+    "marked from_benchmark were misrouted on the constructed benchmark and cost 57-149 s each.",
+    "Rows marked held_out were written after the prompt was last changed and are not echoed in it; in_prompt rows appear there nearly verbatim, so they flatter it."
+  ],
+  "rows": [
+    {
+      "query": "read the code shown in the dark box near the top of the screen",
+      "executor": "visual_text_extraction"
+    },
+    {
+      "query": "what does the slide say",
+      "executor": "visual_text_extraction"
+    },
+    {
+      "query": "identify all license plate numbers",
+      "executor": "visual_text_extraction"
+    },
+    {
+      "query": "what is the price on the menu board",
+      "executor": "visual_text_extraction"
+    },
+    {
+      "query": "read the file name shown in the editor tab",
+      "executor": "visual_text_extraction"
+    },
+    {
+      "query": "what number is on the jersey of the player who scores",
+      "executor": "visual_text_extraction"
+    },
+    {
+      "query": "what is written on the whiteboard",
+      "executor": "visual_text_extraction"
+    },
+    {
+      "query": "what's the name on the storefront sign",
+      "executor": "visual_text_extraction"
+    },
+    {
+      "query": "tennis court with NY text on wall",
+      "executor": "temporal_grounding",
+      "from_benchmark": true,
+      "in_prompt": true
+    },
+    {
+      "query": "standing in front of HAB prediction poster at conference",
+      "executor": "temporal_grounding",
+      "from_benchmark": true
+    },
+    {
+      "query": "Returns Thanks For Watching title card",
+      "executor": "temporal_grounding",
+      "from_benchmark": true,
+      "in_prompt": true
+    },
+    {
+      "query": "the slide titled Results appears",
+      "executor": "temporal_grounding"
+    },
+    {
+      "query": "when the Welcome banner is shown",
+      "executor": "temporal_grounding"
+    },
+    {
+      "query": "person walking past a STOP sign",
+      "executor": "temporal_grounding"
+    },
+    {
+      "query": "a man holding a sign that says hello",
+      "executor": "temporal_grounding"
+    },
+    {
+      "query": "the opening logo animation",
+      "executor": "temporal_grounding"
+    },
+    {
+      "query": "scrolling through code in an editor",
+      "executor": "temporal_grounding"
+    },
+    {
+      "query": "when does she change slides",
+      "executor": "temporal_grounding"
+    },
+    {
+      "query": "find a red car",
+      "executor": "temporal_grounding"
+    },
+    {
+      "query": "when does someone get out of the car",
+      "executor": "temporal_grounding"
+    },
+    {
+      "query": "tennis practice on outdoor court",
+      "executor": "temporal_grounding"
+    },
+    {
+      "query": "when does she say thank you",
+      "executor": "temporal_grounding"
+    },
+    {
+      "query": "the scoreboard showing 3-2",
+      "executor": "temporal_grounding",
+      "held_out": true
+    },
+    {
+      "query": "a truck with FedEx painted on the side",
+      "executor": "temporal_grounding",
+      "held_out": true
+    },
+    {
+      "query": "presenter next to the slide that says Q3 Revenue",
+      "executor": "temporal_grounding",
+      "held_out": true
+    },
+    {
+      "query": "the Exit sign above the door",
+      "executor": "temporal_grounding",
+      "held_out": true
+    },
+    {
+      "query": "a banner reading Happy Birthday",
+      "executor": "temporal_grounding",
+      "held_out": true
+    },
+    {
+      "query": "what time is shown on the clock on the wall",
+      "executor": "visual_text_extraction",
+      "held_out": true
+    },
+    {
+      "query": "which street is written on the road sign",
+      "executor": "visual_text_extraction",
+      "held_out": true
+    },
+    {
+      "query": "what is the username in the login box",
+      "executor": "visual_text_extraction",
+      "held_out": true
+    },
+    {
+      "query": "read the caption at the bottom of the screen",
+      "executor": "visual_text_extraction",
+      "held_out": true
+    },
+    {
+      "query": "what brand is printed on the cup",
+      "executor": "visual_text_extraction",
+      "held_out": true
+    },
+    {
+      "query": "the delivery van marked Amazon Prime",
+      "executor": "temporal_grounding",
+      "held_out": true
+    },
+    {
+      "query": "a mug with World's Best Dad on it",
+      "executor": "temporal_grounding",
+      "held_out": true
+    },
+    {
+      "query": "graffiti spelling LOVE on the bridge",
+      "executor": "temporal_grounding",
+      "held_out": true
+    },
+    {
+      "query": "the book cover titled Dune",
+      "executor": "temporal_grounding",
+      "held_out": true
+    },
+    {
+      "query": "what flight number is on the departures board",
+      "executor": "visual_text_extraction",
+      "held_out": true
+    },
+    {
+      "query": "what does the tattoo on his arm say",
+      "executor": "visual_text_extraction",
+      "held_out": true
+    },
+    {
+      "query": "what is the license plate of the blue truck",
+      "executor": "visual_text_extraction",
+      "held_out": true
+    },
+    {
+      "query": "tell me the title of the book she is reading",
+      "executor": "visual_text_extraction",
+      "held_out": true
+    }
+  ]
+}

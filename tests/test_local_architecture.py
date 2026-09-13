@@ -177,6 +177,38 @@ class LocalArchitectureTest(unittest.TestCase):
             plan = plan_query("something happens and then something else")
         self.assertEqual([(rule["first"], rule["then"]) for rule in plan["ordering"]], [("a", "b")])
 
+    def test_text_route_is_checked_before_it_is_trusted(self):
+        text_plan = {"executor": "visual_text_extraction", "weights": {}, "target_object": "banner"}
+        moment_plan = {
+            "executor": "temporal_grounding",
+            "weights": {"video": 1, "metadata": 0, "transcript_semantic": 0, "transcript_bm25": 0},
+            "evidence_predicates": [{"id": "a", "description": "a banner", "role": "target",
+                                     "modalities": ["video"], "required": True, "importance": 0.9}],
+        }
+        stated = {"stated_text": "Happy Birthday", "asks_for_unknown_text": False}
+        calls = []
+
+        def planner(prompt, schema, images=None, role="vision"):
+            calls.append(schema)
+            if "asks_for_unknown_text" in schema["properties"]:
+                return stated
+            return moment_plan if len(calls) > 2 else text_plan
+
+        with patch.object(local, "chat_json", side_effect=planner):
+            plan = plan_query("a banner reading Happy Birthday")
+        self.assertEqual(plan["executor"], "temporal_grounding")
+        self.assertEqual(plan["rerouted"], {"from": "visual_text_extraction", "stated_text": "Happy Birthday"})
+        # The re-plan is constrained, not merely asked nicely.
+        self.assertEqual(calls[-1]["properties"]["executor"]["enum"], ["temporal_grounding"])
+
+        calls.clear()
+        stated = {"stated_text": "", "asks_for_unknown_text": True}
+        with patch.object(local, "chat_json", side_effect=planner):
+            plan = plan_query("what does the banner say")
+        self.assertEqual(plan["executor"], "visual_text_extraction")
+        self.assertNotIn("rerouted", plan)
+        self.assertEqual(len(calls), 2)  # one plan, one check - no re-plan when the reader is right
+
     def test_prefilter_is_inert_until_a_model_is_trained(self):
         from video_retrieval import learning
 
