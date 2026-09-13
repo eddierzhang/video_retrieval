@@ -209,10 +209,46 @@ so they inherit its blind spots. Use them for tuning and for catching regression
 hand-checked rows as the anchor - a model-derived label once quietly agreed with a hallucination
 here, and only reading the frame caught it.
 
+### Answers known by construction
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.construct --ingest       # build timelines, add and index them
+.\.venv\Scripts\python.exe -m bench.run --dataset bench\constructed.json --mode quick
+```
+
+Every label above traces back to the vision model, so none of them can catch it being wrong. This
+builds the one kind of ground truth that does not: an edit list. Whole described chunks from indexed
+videos are cut, normalised to one format and spliced into new timelines, and random codes
+(`K7X-4629`) are drawn onto known frames. A row's interval is where the chunk was placed; a text
+row's answer is the string that was drawn. Checked by extracting frames: the code is on screen
+inside its window and absent a second before, and a two-minute timeline drifts 21 ms from its
+placements.
+
+What an edit list cannot make exact is written into the rows. Event queries are still worded from
+the scene model's description of the chunk. Two chunks from one source can look alike, so chunks
+from the same video must differ in what the scene model listed, and any that share a source record
+each other as `confusable_with`. Every constructed boundary is also a hard cut, which real events
+are not - see the boundary model below for what that does.
+
+### Every run is recorded
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.tracking list
+.\.venv\Scripts\python.exe -m bench.tracking compare <run> <run>
+```
+
+Each benchmark and trainer writes a folder under `bench/runs/`: the command and every argument, the
+seed, the git commit and whether the tree had uncommitted changes (with a hash of the diff), library
+versions, the GPU, a SHA-256 of every input file, per-step metrics, and a hash of every model it
+wrote. A run that crashes or stops early is recorded too. `compare` lists what two runs disagreed
+on and says when their inputs differed, so "the model improved" gets checked against "the data
+changed" first. Every trainer takes `--seed`; the first comparison showed that on this much data a
+different seed moves the *baseline*, because it changes which searches are held out.
+
 ## Learning from the pipeline's own output
 
-Two optional models, trained from data the system produces as you use it. Neither exists until you
-train it, and every path falls back to the previous behaviour when the file is absent.
+Optional models, trained from data the system produces as you use it. None exists until you train
+it, and every path falls back to the previous behaviour when the file is absent.
 
 ### Candidate pre-filter, distilled from the verifier
 
@@ -319,6 +355,61 @@ On the three videos indexed here - 430 texts across 30 spans - it moves held-out
 the noise. Treat a number like that as "nothing broke", not as a gain, and confirm any adapter
 against `bench.run` before trusting it.
 
+### Clip boundaries, from the frame embeddings
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.boundaries                     # train on constructed intervals
+.\.venv\Scripts\python.exe -m bench.boundaries --proposals bench\results\<run>.json   # real proposals
+```
+
+A quick-mode answer is an evidence region padded by ten seconds either side, which is most of why its
+IoU is low. The per-second frame embeddings already hold two curves that say where an event starts
+and ends: how well each second matches the query, and how different it looks from the second
+before. Each proposed boundary is scored at every second within a window by a linear model over
+features of both curves - a softmax over positions - fitted on the exact constructed intervals. Quick
+mode applies it when a model exists, in milliseconds and without a vision call.
+
+Held out by whole timeline, across three seeds, from simulated proposals:
+
+| Method | Mean IoU | Boundary error |
+| --- | --- | --- |
+| Proposal as given | 0.835-0.850 | ~2.9 s |
+| Snap to the biggest cut | 0.817-0.841 | ~3.0 s |
+| Sit on the similarity step | 0.877-0.895 | ~2.2 s |
+| Learned, with cut features | 0.892-0.909 | ~1.7 s |
+| **Learned, no cut features** | **0.916-0.935** | **~1.4 s** |
+
+The cut features were expected to flatter the model, because every constructed boundary is a hard
+cut. They did the opposite: the source footage has cuts of its own, and the two cut features came
+out nearly equal and opposite. So the no-cuts model is saved by default and `--with-cuts` has to be
+asked for. These proposals start close to the truth; real quick-mode ones do not, which is what
+`--proposals` is for - `bench.run` records each row's match intervals so a result file can be used.
+
+### When to stop verifying, learned by replaying searches
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.replay                       # every match counts
+.\.venv\Scripts\python.exe -m bench.replay --goal first          # only the first one does
+.\.venv\Scripts\python.exe -m bench.replay --value-seconds 120 --ranker
+```
+
+Choosing when to stop asking the vision model about candidates is a sequential decision problem, and
+learning one by trial costs a minute or more per attempt. But each verified search logs every
+candidate's verdict and what it cost to verify, so a search can be replayed: a policy asks for
+candidates in its own order, the replay answers from the log and charges the logged seconds, and an
+episode costs microseconds.
+
+The reward is `value-seconds` per confirmed match minus the seconds spent. On held-out searches it
+compares verifying everything (today's behaviour), a fixed top-k, a static probability threshold,
+**optimal stopping** by backward induction over the ordered list, and **fitted Q iteration**, which
+learns the value of verifying from replayed outcomes instead of trusting the probabilities. When
+fitted Q wins, the probabilities were not telling the whole story. A test checks the backward
+induction against brute force over 300 random lists, and a sweep over what a match is worth shows the
+policy moving from verifying nothing to verifying nearly everything.
+
+The replay can only answer for candidates that were verified. That holds for every logged candidate
+until a ranker is trained, and afterwards only for the explored rows - one more reason they exist.
+
 ## Project layout
 
 | Path | What it holds |
@@ -336,7 +427,11 @@ against `bench.run` before trusting it.
 | `video_retrieval/pipeline.py` | `RetrievalResources` and `VideoRetrievalPipeline` |
 | `webapp/` | Local web app: Starlette API, job queue, library on disk, and the UI in `webapp/static/` |
 | `video_retrieval/learning.py` | The optional learned pieces: candidate pre-filter, ranker with its conformal set, and query adapter |
-| `bench/` | Labeled and synthetic pairs, the accuracy runner, and the trainers: `distill`, `rank`, `adapt` |
+| `video_retrieval/boundaries.py` | Learned clip boundaries from per-second similarity and visual change |
+| `bench/` | Labeled, synthetic and constructed rows, the accuracy runner, and the trainers: `distill`, `rank`, `adapt`, `boundaries` |
+| `bench/construct.py` | Benchmark timelines with answers known from the edit list |
+| `bench/replay.py` | Search replay, optimal stopping and fitted Q |
+| `bench/tracking.py` | Run records under `bench/runs/`, listing and comparison |
 | `model_completed.ipynb` | Notebook walkthrough of the same pipeline |
 
 ### Where data lives
