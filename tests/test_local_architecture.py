@@ -696,6 +696,90 @@ class LocalArchitectureTest(unittest.TestCase):
         self.assertTrue(any(m["start"] <= 30 and m["end"] >= 38 for m in result["matches"]))
         self.assertIn("evidence_map", result["diagnostics"])
 
+    def _tuning_fixture(self):
+        plan = {"executor": "temporal_grounding", "return_mode": "all", "expected_duration": {"min_seconds": 2, "max_seconds": 6},
+                "weights": {"video": 0.7, "metadata": 0.3, "transcript_semantic": 0.0, "transcript_bm25": 0.0}}
+        hits = {"video": [[{"start": 30, "end": 38, "score": 0.9}, {"start": 70, "end": 78, "score": 0.6},
+                           {"start": 100, "end": 104, "score": 0.3}]],
+                "metadata": [[{"start": 34, "end": 44, "score": 0.8}, {"start": 72, "end": 80, "score": 0.7}]],
+                "negative": [[{"start": 70, "end": 76, "score": 0.9}]],
+                "transcript_semantic": [], "transcript_bm25": []}
+        return plan, hits
+
+    def test_tuning_replays_exactly_what_a_quick_search_answers(self):
+        from bench import tune
+        from video_retrieval import boundaries as learned_boundaries
+        from video_retrieval.retrieval import scoring_override
+
+        plan, hits = self._tuning_fixture()
+        row = {"plan": plan, "results": hits, "duration": 120.0, "signal": None}
+        unusual = tune.defaults()
+        unusual["pipeline"].update(candidate_padding=2.0, evidence_bin_size=1.0, nms_iou_threshold=0.3,
+                                   recursive_min_window_seconds=6.0)
+        unusual["scoring"].update(negative_evidence_weight=1.4, peak_share=0.5, window_peak=0.9)
+        for settings in (tune.defaults(), unusual):
+            with patch("video_retrieval.pipeline.plan_query", return_value=plan), \
+                    patch("video_retrieval.pipeline.run_retrieval_plan", return_value=hits), \
+                    patch.object(learned_boundaries, "load_boundary_model", return_value=None), \
+                    patch("video_retrieval.pipeline.materialize_final_matches",
+                          side_effect=lambda manifest, instances, query, **kw: (instances, "results.json")), \
+                    scoring_override(settings["scoring"]):
+                live = retrieve_video("a car", RetrievalResources(manifest={"video": {"duration": 120}}),
+                                      run_verification=False, **settings["pipeline"])
+            expected = [(m["start"], m["end"]) for m in sorted(live["matches"], key=lambda m: -m["confidence"])]
+            replayed = [(m["start"], m["end"]) for m in tune.replay(row, settings, None)]
+            self.assertTrue(expected)
+            self.assertEqual(replayed, expected)
+        # The unusual settings really do change the answer, so the comparison above means something.
+        self.assertNotEqual(tune.replay(row, tune.defaults(), None), tune.replay(row, unusual, None))
+
+    def test_tuned_settings_apply_only_in_their_own_mode(self):
+        from video_retrieval import pipeline as pipeline_module
+        from video_retrieval.retrieval import scoring
+
+        tuned = {"mode": "quick", "run": "r1", "pipeline": {"candidate_padding": 1.0, "nms_iou_threshold": 0.4},
+                 "scoring": {"peak_share": 0.5}}
+        seen = []
+
+        def capture(**kwargs):
+            seen.append((kwargs, scoring()["peak_share"]))
+            return {"matches": []}
+
+        resources = RetrievalResources(manifest={}, local_models=local.LocalModels())
+        with patch.object(pipeline_module, "load_tuned_settings", return_value=tuned), \
+                patch("video_retrieval.pipeline.retrieve_video", side_effect=capture):
+            quick = VideoRetrievalPipeline(resources).retrieve("q", run_verification=False, candidate_padding=7.0)
+            VideoRetrievalPipeline(resources).retrieve("q", run_verification=True)
+        (quick_kwargs, quick_share), (verified_kwargs, verified_share) = seen
+        self.assertEqual(quick_kwargs["nms_iou_threshold"], 0.4)
+        self.assertEqual(quick_kwargs["candidate_padding"], 7.0)  # an explicit argument still wins
+        self.assertEqual(quick_share, 0.5)
+        self.assertEqual(quick["tuned_settings"], "r1")
+        self.assertNotIn("nms_iou_threshold", verified_kwargs)
+        self.assertEqual(verified_share, 0.80)
+        self.assertEqual(scoring()["peak_share"], 0.80)  # and nothing leaks out of the search
+
+    def test_tuning_search_stays_in_bounds_and_folds_never_share_a_timeline(self):
+        import inspect
+        import random
+
+        from bench import tune
+
+        signature = inspect.signature(retrieve_video).parameters
+        self.assertEqual(tune.defaults()["pipeline"]["candidate_padding"], signature["candidate_padding"].default)
+        generator = random.Random(0)
+        for _ in range(200):
+            values = tune.perturb(tune.sample(tune.SCORING_SPACE, generator), tune.SCORING_SPACE, generator, 0.5)
+            for name, (kind, low, high) in tune.SCORING_SPACE.items():
+                self.assertTrue(low <= values[name] <= high)
+        rows = [{"timeline": t, "id": f"{t}-{i}"} for t in range(7) for i in range(3)]
+        folds = tune.folds_by_timeline(rows, 3, seed=0)
+        self.assertEqual(sum(len(fold) for fold in folds), len(rows))
+        timelines = [{row["timeline"] for row in fold} for fold in folds]
+        for i, left in enumerate(timelines):
+            for right in timelines[i + 1:]:
+                self.assertFalse(left & right)
+
     def test_local_chat_is_loopback_validated_and_disables_thinking(self):
         schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
         response = Mock(status_code=200)
