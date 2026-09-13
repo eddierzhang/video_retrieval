@@ -1,0 +1,4 @@
+# Store text as LF everywhere, so diffs are identical on every OS.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.ipynb text eol=lf
