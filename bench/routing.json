@@ -189,6 +189,12 @@
       "query": "tell me the title of the book she is reading",
       "executor": "visual_text_extraction",
       "held_out": true
+    },
+    {
+      "query": "MQ2 MQ7 gas sensor cost $10 patent document",
+      "executor": "temporal_grounding",
+      "from_benchmark": true,
+      "hard": true
     }
   ]
 }

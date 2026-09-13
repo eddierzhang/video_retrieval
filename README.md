@@ -230,6 +230,51 @@ from the same video must differ in what the scene model listed, and any that sha
 each other as `confusable_with`. Every constructed boundary is also a hard cut, which real events
 are not - see the boundary model below for what that does.
 
+### Routing
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.routing
+```
+
+The first thing a search decides is which executor answers it, and the costly mistake is sending a
+moment to the text reader: a minute or more of OCR that comes back empty. On the constructed
+benchmark the planner did that whenever a scene was described by its text ("tennis court with NY
+text on wall"). `bench/routing.json` labels queries by the kind of answer wanted, and the planner
+went from 16 of 22 to all of them after two changes: the prompt now asks whether the user already
+states the text (if they wrote it, they cannot be asking what it says), and a text route is checked
+with one narrow question and re-planned under a schema that only allows temporal grounding when the
+answer is no. Two held-out batches written after those changes routed 18 of 18. One keyword-soup
+query from the benchmark still misroutes and is kept in the file as a hard case.
+
+### Tuning how a moment is picked
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.tune
+```
+
+Which window wins a quick search is decided by eight scoring weights (`retrieval.DEFAULT_SCORING`)
+and twelve evidence-map, candidate, refinement and NMS settings, all chosen by hand. Each constructed
+row's plan and retrieval hits are cached once, and a trial replays only the model-free stages - the
+same `locate_candidates`, NMS and learned boundaries a quick search runs - so a trial over every row
+takes half a second. A test, and a live check on real rows, confirm the replay returns exactly what
+the pipeline does.
+
+Cross-validated by timeline over 59 rows from 10 timelines, 300 trials per fold:
+
+| | Held-out top-1 IoU | Folds improved |
+| --- | --- | --- |
+| Hand-picked defaults | 0.406 | |
+| **Tuned** | **0.523** | **5 of 5** |
+
+The saved settings (`local_data/learning/retrieval_settings.json`) apply only to quick searches;
+delete the file to go back. The biggest moves were less padding around candidates (10 s to 2.7 s), a
+shallower recursive search, and window scores that favour sustained evidence over a single peak.
+
+Read the gain with two caveats. Every constructed event is a whole 30-second chunk, so settings that
+favour broad, sustained evidence may be tuned to that length rather than to events in general. And
+timelines draw from the same pool of source chunks, so a held-out timeline can contain footage a fit
+timeline also used - folds keep timelines apart, not source footage.
+
 ### Every run is recorded
 
 ```powershell
@@ -432,6 +477,8 @@ until a ranker is trained, and afterwards only for the explored rows - one more 
 | `bench/construct.py` | Benchmark timelines with answers known from the edit list |
 | `bench/replay.py` | Search replay, optimal stopping and fitted Q |
 | `bench/tracking.py` | Run records under `bench/runs/`, listing and comparison |
+| `bench/routing.py` | Executor routing accuracy against labeled queries |
+| `bench/tune.py` | Cross-validated search over how a quick search picks its moment |
 | `model_completed.ipynb` | Notebook walkthrough of the same pipeline |
 
 ### Where data lives
