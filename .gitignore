@@ -28,4 +28,4 @@ transcript_index/
 # stray Cygwin crash dumps
 *.stackdump
 bench/runs/
-bench/constructed.json
+bench/constructed*.json

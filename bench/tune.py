@@ -174,18 +174,61 @@ def replay(row, settings, boundary_model):
     return instances
 
 
-def evaluate(rows, settings, boundary_model):
-    top, best, hits = [], [], []
+DURATION_BUCKETS = ((0.0, 8.0, "under 8 s"), (8.0, 15.0, "8-15 s"), (15.0, 25.0, "15-25 s"),
+                    (25.0, float("inf"), "25 s and over"))
+
+
+def row_scores(rows, settings, boundary_model):
+    """Per row: IoU of the most confident answer, the best of the top five, and a 0.3 hit."""
+    scored = []
     for row in rows:
         answers = replay(row, settings, boundary_model)
         truth = (float(row["expect"]["start"]), float(row["expect"]["end"]))
         scores = [iou(*truth, float(answer["start"]), float(answer["end"])) for answer in answers[:5]]
-        top.append(scores[0] if scores else 0.0)
-        best.append(max(scores, default=0.0))
-        hits.append(float(top[-1] >= 0.3))
-    return {"top1_iou": float(np.mean(top)) if top else float("nan"),
-            "best5_iou": float(np.mean(best)) if best else float("nan"),
-            "top1_accuracy": float(np.mean(hits)) if hits else float("nan")}
+        top = scores[0] if scores else 0.0
+        scored.append((row, top, max(scores, default=0.0), float(top >= 0.3)))
+    return scored
+
+
+def summarise(scored):
+    column = lambda index: float(np.mean([item[index] for item in scored])) if scored else float("nan")
+    return {"top1_iou": column(1), "best5_iou": column(2), "top1_accuracy": column(3), "rows": len(scored)}
+
+
+def evaluate(rows, settings, boundary_model):
+    return summarise(row_scores(rows, settings, boundary_model))
+
+
+def event_seconds(row):
+    return float(row["expect"]["end"]) - float(row["expect"]["start"])
+
+
+def by_duration(scored):
+    """The same summary, split by how long the true event is."""
+    report = {}
+    for low, high, label in DURATION_BUCKETS:
+        bucket = [item for item in scored if low <= event_seconds(item[0]) < high]
+        if bucket:
+            report[label] = summarise(bucket)
+    return report
+
+
+def print_duration_table(title, default_scored, tuned_scored):
+    print(f"\n{title}")
+    print(f"   {'event length':<16}{'rows':>6}{'defaults':>11}{'tuned':>9}{'change':>9}")
+    before, after = by_duration(default_scored), by_duration(tuned_scored)
+    for _, _, label in DURATION_BUCKETS:
+        if label in before:
+            first, second = before[label]["top1_iou"], after[label]["top1_iou"]
+            print(f"   {label:<16}{before[label]['rows']:>6}{first:>11.3f}{second:>9.3f}{second - first:>+9.3f}")
+    return before, after
+
+
+def settings_from(document):
+    """Saved settings laid over the defaults, so a setting added since still has a value."""
+    base = defaults()
+    return {"pipeline": {**base["pipeline"], **(document.get("pipeline") or {})},
+            "scoring": {**base["scoring"], **(document.get("scoring") or {})}}
 
 
 # ------------------------------------------------------------------ searching
@@ -235,7 +278,8 @@ def search(rows, trials, refine, rng, boundary_model, log=None):
 
 
 def timeline_of(row):
-    return row["timeline"] if "timeline" in row else row["video"]
+    # The video name, because every constructed set numbers its timelines from 1.
+    return row["video"] if "video" in row else row["timeline"]
 
 
 def folds_by_timeline(rows, count, seed):
@@ -248,7 +292,11 @@ def folds_by_timeline(rows, count, seed):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset", default=str(DATASET))
+    parser.add_argument("--dataset", action="append", help="constructed rows; repeatable (default: constructed.json)")
+    parser.add_argument("--evaluate", nargs="?", const=str(TUNED_SETTINGS), metavar="SETTINGS",
+                        help="score saved settings against the defaults on --dataset, without searching")
+    parser.add_argument("--keep-ambiguous", action="store_true",
+                        help="keep rows whose query nearly repeats another in the same timeline")
     parser.add_argument("--trials", type=int, default=200, help="random settings tried per search")
     parser.add_argument("--refine", type=int, default=100, help="hill-climbing steps after that")
     parser.add_argument("--folds", type=int, default=5, help="cross-validation folds, by timeline")
@@ -264,10 +312,17 @@ def main():
         from video_retrieval.local_backend import LocalModels
         from webapp.library import Library
 
-        run.input(args.dataset)
-        document = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
-        rows = [row for row in document["rows"] if row["expect"].get("end") is not None and "text" not in row["expect"]]
-        print(f"{len(rows)} event rows across {len({row.get('timeline') for row in rows})} timelines")
+        rows = []
+        for path in args.dataset or [str(DATASET)]:
+            run.input(path)
+            document = json.loads(Path(path).read_text(encoding="utf-8"))
+            rows.extend(row for row in document["rows"]
+                        if row["expect"].get("end") is not None and "text" not in row["expect"])
+        ambiguous = [row for row in rows if row.get("ambiguous_with")]
+        if ambiguous and not args.keep_ambiguous:
+            rows = [row for row in rows if not row.get("ambiguous_with")]
+            print(f"{len(ambiguous)} rows left out because their query nearly repeats another in the same timeline")
+        print(f"{len(rows)} event rows across {len({timeline_of(row) for row in rows})} timelines")
         models = LocalModels()
         run.note(models=models.signature())
         rows = cache_rows(rows, Library(), models, run)
@@ -288,6 +343,19 @@ def main():
         print(f"one trial replays every row in {per_trial * 1000:.0f} ms")
         run.summarize(defaults=default_score, trial_seconds=per_trial)
         if args.dry_run:
+            return
+
+        if args.evaluate:
+            saved = json.loads(Path(args.evaluate).read_text(encoding="utf-8"))
+            run.input(args.evaluate)
+            default_scored = row_scores(rows, defaults(), boundary_model)
+            tuned_scored = row_scores(rows, settings_from(saved), boundary_model)
+            tuned = summarise(tuned_scored)
+            print(f"\nsettings from run {saved.get('run')}, tuned on {saved.get('rows')} rows")
+            print(f"all {len(rows)} rows: top-1 IoU {default_score['top1_iou']:.3f} -> {tuned['top1_iou']:.3f}   "
+                  f"accuracy {default_score['top1_accuracy']:.0%} -> {tuned['top1_accuracy']:.0%}")
+            before, after = print_duration_table("by length of the true event (top-1 IoU)", default_scored, tuned_scored)
+            run.summarize(evaluated=args.evaluate, tuned=tuned, by_duration={"defaults": before, "tuned": after})
             return
 
         rng = random.Random(args.seed)

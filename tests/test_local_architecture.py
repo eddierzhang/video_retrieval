@@ -696,6 +696,41 @@ class LocalArchitectureTest(unittest.TestCase):
         self.assertTrue(any(m["start"] <= 30 and m["end"] >= 38 for m in result["matches"]))
         self.assertIn("evidence_map", result["diagnostics"])
 
+    def test_short_events_are_balanced_sliced_and_flag_their_look_alikes(self):
+        import random
+
+        from bench.construct import choose_segments, query_overlap, slice_chunk
+
+        # One video with twenty chunks and three with one each: uniform draws fill up on the first.
+        pool = [{"video": "tennis", "video_id": "tennis", "start": 40.0 * i, "end": 40.0 * i + 30,
+                 "terms": [f"term{i}"], "actions": []} for i in range(20)]
+        pool += [{"video": name, "video_id": name, "start": 0.0, "end": 30.0, "terms": [name], "actions": []}
+                 for name in ("heart", "code", "court")]
+        for seed in range(10):
+            chosen = choose_segments(pool, 4, random.Random(seed), balanced=True)
+            self.assertEqual(len({chunk["video_id"] for chunk in chosen}), 4)
+        piece = slice_chunk(pool[3], random.Random(0), 4.0, 20.0)
+        self.assertTrue(pool[3]["start"] <= piece["start"] < piece["end"] <= pool[3]["end"])
+        self.assertTrue(4.0 <= piece["end"] - piece["start"] <= 20.0 + 1e-6)
+        self.assertEqual(piece["queries"], [])  # the parent chunk's queries describe thirty seconds, not this
+        self.assertGreaterEqual(query_overlap("person practicing tennis forehand on outdoor court",
+                                              "person practicing tennis forehands on outdoor court"), 0.5)
+        self.assertLess(query_overlap("man explains heart transplant", "person practicing tennis"), 0.5)
+
+    def test_tuning_reports_by_event_length_and_fills_in_missing_settings(self):
+        from bench import tune
+
+        rows = [{"expect": {"start": 0, "end": length}} for length in (5, 12, 30)]
+        scored = [(rows[0], 0.2, 0.2, 0.0), (rows[1], 0.6, 0.6, 1.0), (rows[2], 0.9, 0.9, 1.0)]
+        report = tune.by_duration(scored)
+        self.assertEqual(set(report), {"under 8 s", "8-15 s", "25 s and over"})
+        self.assertAlmostEqual(report["under 8 s"]["top1_iou"], 0.2)
+        partial = tune.settings_from({"pipeline": {"candidate_padding": 3.0}, "scoring": {}})
+        self.assertEqual(partial["pipeline"]["candidate_padding"], 3.0)
+        self.assertEqual(partial["pipeline"]["nms_iou_threshold"], tune.defaults()["pipeline"]["nms_iou_threshold"])
+        self.assertEqual(tune.timeline_of({"video": "Constructed short timeline 1.mp4", "timeline": 1}),
+                         "Constructed short timeline 1.mp4")
+
     def _tuning_fixture(self):
         plan = {"executor": "temporal_grounding", "return_mode": "all", "expected_duration": {"min_seconds": 2, "max_seconds": 6},
                 "weights": {"video": 0.7, "metadata": 0.3, "transcript_semantic": 0.0, "transcript_bm25": 0.0}}

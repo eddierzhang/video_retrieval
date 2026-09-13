@@ -4,6 +4,7 @@
     python -m bench.construct --ingest           also add them to the library and index them
     python -m bench.construct --timelines 4 --segments 5 --seed 2
     python -m bench.construct --append --timelines 7 --ingest   add seven more to the existing set
+    python -m bench.construct --event-seconds 4 20 --segments 10 --out bench/constructed_short.json --ingest
     python -m bench.run --dataset bench/constructed.json --mode quick
 
 Every other label in this project traces back to the vision model: synthetic queries are its
@@ -119,10 +120,22 @@ def similarity(left, right):
     return len(a & b) / len(a | b) if a and b else 0.0
 
 
-def choose_segments(pool, count, rng, max_similarity=0.35):
-    """Chunks for one timeline: never overlapping in their source, never near-duplicates."""
+def choose_segments(pool, count, rng, max_similarity=0.35, balanced=False):
+    """Chunks for one timeline: never overlapping in their source, never near-duplicates.
+
+    `balanced` draws round-robin across source videos instead of uniformly across chunks, so one
+    long video with many chunks does not fill a timeline with look-alikes.
+    """
     order = list(range(len(pool)))
     rng.shuffle(order)
+    if balanced:
+        by_video = {}
+        for index in order:
+            by_video.setdefault(pool[index]["video_id"], []).append(index)
+        queues, order = list(by_video.values()), []
+        while any(queues):
+            rng.shuffle(queues)
+            order.extend(queue.pop() for queue in queues if queue)
     chosen = []
     for index in order:
         chunk = pool[index]
@@ -148,6 +161,44 @@ def query_for(chunk, rng):
         return rng.choice(chunk["queries"]), "synthetic"
     sentence = chunk["summary"].split(". ")[0]
     return " ".join(sentence.split()[:16]).rstrip("."), "summary"
+
+
+SLICE_SCHEMA = {
+    "type": "object",
+    "properties": {"query": {"type": "string"}},
+    "required": ["query"],
+    "additionalProperties": False,
+}
+
+
+def describe_slice(chunk):
+    """A query written for exactly this slice, since the chunk's own description covers 30 seconds."""
+    from video_retrieval.local_backend import interval_json
+
+    prompt = (
+        f"These frames are one continuous {chunk['end'] - chunk['start']:.0f}-second clip. Write the search "
+        "query a person would type to find exactly this clip in a longer video: 4 to 12 words naming "
+        "what is visibly happening or shown that makes it recognisable. No timestamps, and do not use "
+        "the words clip, video, frame or scene."
+    )
+    answer = interval_json(chunk["source"], chunk["start"], chunk["end"], prompt, SLICE_SCHEMA,
+                           role="vision", include_speech=False)
+    return " ".join(str(answer.get("query", "")).split()[:14]).strip().rstrip(".")
+
+
+def slice_chunk(chunk, rng, shortest, longest):
+    """A random stretch of `shortest` to `longest` seconds from inside a described chunk."""
+    available = chunk["end"] - chunk["start"]
+    length = min(available, rng.uniform(shortest, longest))
+    offset = rng.uniform(0.0, max(0.0, available - length))
+    start = round(chunk["start"] + offset, 3)
+    return {**chunk, "start": start, "end": round(start + length, 3), "queries": []}
+
+
+def query_overlap(left, right):
+    a = {word.strip(".,;:!?\"'()").lower() for word in left.split()}
+    b = {word.strip(".,;:!?\"'()").lower() for word in right.split()}
+    return len(a & b) / len(a | b) if a and b else 0.0
 
 
 def make_code(rng):
@@ -200,10 +251,13 @@ def concatenate(parts, target, workdir):
 
 
 def build_timeline(number, pool, args, rng, font):
-    segments = choose_segments(pool, args.segments, rng, args.max_similarity)
+    segments = choose_segments(pool, args.segments, rng, args.max_similarity, balanced=bool(args.event_seconds))
     if len(segments) < 2:
         raise SystemExit("Not enough distinct described chunks in the library to build a timeline.")
-    name = f"Constructed timeline {number}.mp4"
+    if args.event_seconds:
+        # Short events: a slice of each chunk, so answers are not all exactly thirty seconds long.
+        segments = [slice_chunk(chunk, rng, *args.event_seconds) for chunk in segments]
+    name = f"{args.prefix} {number}.mp4"
     OUTPUT.mkdir(parents=True, exist_ok=True)
     target = OUTPUT / name.replace(" ", "_")
     overlays = set(rng.sample(range(len(segments)), min(args.text, len(segments)))) if font else set()
@@ -223,7 +277,10 @@ def build_timeline(number, pool, args, rng, font):
             # The measured length, not the requested one, is what the next segment starts after.
             actual = render_segment(chunk, part, workdir, overlay)
             parts.append(part)
-            query, query_source = query_for(chunk, rng)
+            if args.event_seconds:
+                query, query_source = describe_slice(chunk), "vision-slice"
+            else:
+                query, query_source = query_for(chunk, rng)
             placed.append({
                 "position": position, "video": chunk["video"], "source_start": chunk["start"],
                 "source_end": chunk["end"], "start": round(cursor, 3), "end": round(cursor + actual, 3),
@@ -237,14 +294,19 @@ def build_timeline(number, pool, args, rng, font):
     for segment in placed:
         confusable = [other["position"] for other in placed
                       if other is not segment and other["video"] == segment["video"]]
+        # Two segments whose queries say nearly the same thing cannot both be found by any setting;
+        # a miss on one of them is noise, so the row says so and bench.tune leaves it out.
+        ambiguous = [other["position"] for other in placed
+                     if other is not segment and query_overlap(other["query"], segment["query"]) >= 0.5]
         base = {"video": name, "mode": "verified", "source": "constructed", "label_confidence": "exact",
-                "timeline": number, "segment": segment["position"], "confusable_with": confusable}
-        rows.append({**base, "id": f"con-{number}-{segment['position']}-event", "query": segment["query"],
+                "timeline": number, "segment": segment["position"], "confusable_with": confusable,
+                "ambiguous_with": ambiguous}
+        rows.append({**base, "id": f"{args.id_prefix}-{number}-{segment['position']}-event", "query": segment["query"],
                      "query_source": segment["query_source"],
                      "expect": {"start": segment["start"], "end": segment["end"]}})
         if segment["overlay"]:
             shown = segment["start"] + segment["overlay"]["offset"]
-            rows.append({**base, "id": f"con-{number}-{segment['position']}-text", "query": TEXT_QUERY,
+            rows.append({**base, "id": f"{args.id_prefix}-{number}-{segment['position']}-text", "query": TEXT_QUERY,
                          "query_source": "constructed",
                          "expect": {"text": segment["overlay"]["text"], "start": round(shown, 3),
                                     "end": round(shown + segment["overlay"]["seconds"], 3)}})
@@ -284,6 +346,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--timelines", type=int, default=3)
     parser.add_argument("--segments", type=int, default=6, help="chunks spliced into each timeline")
+    parser.add_argument("--event-seconds", type=float, nargs=2, metavar=("SHORTEST", "LONGEST"),
+                        help="splice slices of this many seconds instead of whole chunks, each with a query "
+                             "the vision model writes for that slice")
+    parser.add_argument("--prefix", default=None, help="library name for the timelines")
+    parser.add_argument("--id-prefix", default=None, help="prefix for row ids")
     parser.add_argument("--text", type=int, default=2, help="segments per timeline that get a drawn code")
     parser.add_argument("--max-similarity", type=float, default=0.35,
                         help="how alike two chunks from one video may be, by what the scene model listed")
@@ -293,6 +360,11 @@ def main():
     parser.add_argument("--out", default=str(DATASET))
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    short = bool(args.event_seconds)
+    args.prefix = args.prefix or ("Constructed short timeline" if short else "Constructed timeline")
+    args.id_prefix = args.id_prefix or ("short" if short else "con")
+    if short and args.event_seconds[0] > args.event_seconds[1]:
+        raise SystemExit("--event-seconds takes the shortest length first.")
 
     seed_everything(args.seed)
     with Run("construct", args, seed=args.seed) as run:
