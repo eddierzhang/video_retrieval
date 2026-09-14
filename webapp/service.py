@@ -11,7 +11,8 @@ import threading
 import time
 
 from video_retrieval.config import DATA_DIR
-from video_retrieval.detect_search import DETECT_STAGES
+from video_retrieval.detect_search import DETECT_STAGES, example_for
+from video_retrieval.feedback_learning import Learner
 from video_retrieval.local_backend import LocalModels, capabilities, check_runtime, devices, installed_models, installed_names, use_models
 from video_retrieval.config import TEXT_EMBEDDING_MODEL
 from video_retrieval.local_indexing import INDEX_STAGES, IndexVersionMismatch, index_key, load_index, prepare_video
@@ -31,10 +32,12 @@ MAX_EVIDENCE_POINTS = 720
 
 
 class Service:
-    def __init__(self, library=None, jobs=None, settings_path=DATA_DIR / "settings.json"):
+    def __init__(self, library=None, jobs=None, settings_path=DATA_DIR / "settings.json", learner=None):
         self.library = library or Library()
         self.jobs = jobs or JobQueue()
         self.settings_path = Path(settings_path)
+        # Right/wrong marks on Detect results train one scorer shared by every video.
+        self.learner = learner or Learner(self.library.root / "_learning")
         self._pipelines = OrderedDict()
         self._lock = threading.Lock()
         self.library.recover_interrupted()
@@ -250,7 +253,8 @@ class Service:
 
             with use_models(models, job.report, job.cancel_event):
                 result = detect_search(search["query"], pipeline.resources, output_root,
-                                       max_frames=options.get("max_frames", 400), max_frames_per_match=8)
+                                       max_frames=options.get("max_frames", 400), max_frames_per_match=8,
+                                       learner=self.learner, search_id=search_id)
             finished = time.time()
             self.library.update_search(job.video_id, search_id, status="done", result=result,
                                        finished_at=finished, elapsed=finished - search["started_at"])
@@ -289,6 +293,8 @@ class Service:
         else:
             feedback[match_key] = label
         self.library.update_search(video_id, search_id, feedback=feedback)
+        example = example_for(self.library.search_dir(video_id, search_id), match_key) if label else None
+        self.learner.record(video_id, search_id, match_key, label, example)
         return self.search(video_id, search_id)
 
     def start_refine(self, video_id, search_id):
@@ -317,7 +323,7 @@ class Service:
         with use_models(self.settings(), job.report, job.cancel_event):
             job.report({"stage": "Assembling results"})
             result = refine(self.library.search_dir(job.video_id, search_id), search.get("feedback") or {},
-                            pipeline.resources, max_frames_per_match=8)
+                            pipeline.resources, max_frames_per_match=8, learner=self.learner, search_id=search_id)
         refinements = int(search.get("refinements") or 0) + 1
         self.library.update_search(job.video_id, search_id, status="done", result=result, refinements=refinements,
                                    finished_at=time.time(), elapsed=time.time() - started)
@@ -373,6 +379,8 @@ class Service:
             record["job"] = self.jobs.get(job_id).to_dict() if job_id else None
         except KeyError:
             record["job"] = None
+        if record.get("mode") == "detect":
+            record["learning"] = self.learner.status()
         return record
 
 

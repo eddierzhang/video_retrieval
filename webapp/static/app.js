@@ -538,6 +538,7 @@ function feedbackBar(s) {
     looking ? h('p', { class: 'feedback-plan' }, `Looked for: ${looking}`) : null,
     s.error ? h('p', { class: 'feedback-error' }, `Refining failed: ${s.error}`) : null,
     s.refinements ? h('p', { class: 'feedback-plan' }, `Refined ${plural(s.refinements, 'time')} with your marks.`) : null,
+    s.learning ? h('p', { class: 'feedback-learning' }, icon('sparkle', 13), learningSummary(s.learning, s.result?.diagnostics?.learning)) : null,
     h('div', { class: 'feedback-row' },
       h('span', { class: 'feedback-count' }, marks.length
         ? `${plural(right, 'result')} marked right · ${wrong} wrong`
@@ -548,11 +549,30 @@ function feedbackBar(s) {
       }, icon('refresh', 14), 'Refine with feedback')));
 }
 
+// One line on what the marks have taught Detect so far, and whether this search used it.
+function learningSummary(learning, used) {
+  const needs = learning.needs || {};
+  const evaluation = learning.evaluation;
+  if (learning.state === 'collecting') {
+    const missing = [];
+    if (learning.examples < needs.examples) missing.push(`${needs.examples - learning.examples} more marks`);
+    if (Math.min(learning.right, learning.wrong) < needs.per_label) missing.push(`at least ${needs.per_label} right and ${needs.per_label} wrong`);
+    if (learning.videos < needs.videos) missing.push(`marks on ${needs.videos} videos`);
+    return `Your marks train Detect: ${plural(learning.examples, 'mark')} saved. It starts learning after ${missing.join(', ') || 'the next mark'}.`;
+  }
+  const scores = evaluation ? ` ${pct(evaluation.learned_accuracy)} right on videos it was not trained on, vs ${pct(evaluation.rules_accuracy)} for the fixed rules.` : '';
+  if (learning.state === 'active') {
+    const note = used?.decided_by === 'learned' ? ' It chose these results.' : ' New searches use it.';
+    return `Learned scorer v${learning.version} is in use, trained on ${plural(learning.examples, 'mark')}:${scores}${note}`;
+  }
+  return `Learned scorer v${learning.version} trained on ${plural(learning.examples, 'mark')} is not yet better than the fixed rules, so they still decide:${scores}`;
+}
+
 async function markResult(s, match, label) {
   const current = (s.feedback || {})[match.match_key];
   try {
     const updated = await api.searchFeedback(state.video.id, s.id, { match_key: match.match_key, label: current === label ? null : label });
-    state.search = { ...state.search, feedback: updated.feedback };
+    state.search = { ...state.search, feedback: updated.feedback, learning: updated.learning };
     renderResults();
   } catch (error) {
     toast(error.message, 'error');
@@ -600,8 +620,9 @@ function matchCard(match, index, s) {
         h('span', { class: 'meter-track', 'aria-hidden': 'true' }, h('span', { class: 'meter-fill', style: { width: pct(Math.min(1, confidence)) } })),
         h('span', {}, {
           quick: `Evidence ${pct(confidence)} · unverified`,
-          detect: `${pct(confidence)} match`,
-        }[s.mode] ?? `${pct(confidence)} confidence`)),
+          detect: match.decided_by === 'learned' ? `${pct(confidence)} likely right` : `${pct(confidence)} match`,
+        }[s.mode] ?? `${pct(confidence)} confidence`),
+        match.near_miss ? h('span', { class: 'chip chip-small near-miss', title: 'The fixed rules rejected this; the learned scorer kept it' }, 'Near miss') : null),
       s.mode === 'detect' && match.match_key ? h('div', { class: 'feedback-buttons', role: 'group', 'aria-label': 'Was this result right?' },
         h('button', {
           type: 'button', class: `button button-ghost button-small${mark === 'positive' ? ' is-right' : ''}`,
@@ -698,6 +719,23 @@ function detectPlan(search, result, plan, d) {
   }
   const marks = d.refined_with;
   if (marks) blocks.push(section('Feedback applied', h('p', {}, `${plural(marks.positive, 'result')} marked right and ${marks.negative} wrong re-scored every detection, without detecting again.`)));
+  const used = d.learning;
+  if (used || search.learning) {
+    const lines = [];
+    if (used) {
+      lines.push(used.decided_by === 'learned'
+        ? `Results chosen by learned scorer v${used.model_version}${used.near_misses_kept ? `, including ${used.near_misses_kept} near ${used.near_misses_kept === 1 ? 'miss' : 'misses'} the fixed rules rejected` : ''}.`
+        : 'Results chosen by the fixed rules.');
+      if (used.remembered && (used.remembered.right || used.remembered.wrong)) {
+        lines.push(`Started from ${used.remembered.right} right and ${used.remembered.wrong} wrong examples remembered from earlier searches for the same thing.`);
+      }
+    }
+    if (search.learning) lines.push(learningSummary(search.learning, used));
+    const history = (search.learning?.history || []).filter((row) => row.learned_accuracy != null);
+    blocks.push(section('Learning from your marks', ...lines.map((line) => h('p', {}, line)),
+      history.length > 1 ? h('p', { class: 'learning-history' }, 'Held-out accuracy by version: '
+        + history.slice(-8).map((row) => `v${row.version} ${pct(row.learned_accuracy)}`).join(' → ')) : null));
+  }
   return blocks;
 }
 

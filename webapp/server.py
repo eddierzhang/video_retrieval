@@ -155,6 +155,9 @@ def create_app(service=None, allowed_hosts=None):
         service.start_refine(params["video_id"], params["search_id"])
         return JSONResponse(service.search(params["video_id"], params["search_id"]), status_code=202)
 
+    async def learning(request):
+        return JSONResponse(service.learner.status())
+
     async def search_file(request):
         params = request.path_params
         return FileResponse(library.search_file(params["video_id"], params["search_id"], params["path"]))
@@ -187,6 +190,7 @@ def create_app(service=None, allowed_hosts=None):
         Route("/api/videos/{video_id}/searches/{search_id}/feedback", feedback, methods=["POST"]),
         Route("/api/videos/{video_id}/searches/{search_id}/refine", refine, methods=["POST"]),
         Route("/api/videos/{video_id}/searches/{search_id}/files/{path:path}", search_file),
+        Route("/api/learning", learning),
         Route("/api/jobs", jobs),
         Route("/api/jobs/{job_id}/cancel", cancel_job, methods=["POST"]),
         Mount("/static", StaticFiles(directory=STATIC_DIR), name="static"),

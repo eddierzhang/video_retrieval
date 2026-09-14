@@ -350,8 +350,11 @@ def adjusted_probability(probability, embedding, positives, negatives, scale, we
     return 1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, logit))))
 
 
-def feedback_exemplars(state, feedback):
-    """Embeddings of what was inside results the user marked right (positives) or wrong (negatives)."""
+def feedback_exemplars(state, feedback, memory=None):
+    """Embeddings of what was inside results marked right (positives) or wrong (negatives).
+
+    `memory` adds (positives, negatives) remembered from marks on earlier searches for the same thing.
+    """
     positives, negatives = [], []
     by_id = {match["match_key"]: match for match in state.get("last_matches", [])}
     for key, label in (feedback or {}).items():
@@ -360,6 +363,9 @@ def feedback_exemplars(state, feedback):
             continue
         bucket = positives if label == "positive" else negatives
         bucket.extend(match.get("exemplars", []))
+    if memory is not None:
+        positives.extend(memory[0])
+        negatives.extend(memory[1])
     return np.asarray(positives, dtype=np.float32), np.asarray(negatives, dtype=np.float32)
 
 
@@ -378,14 +384,24 @@ def spans(times, step, gap_steps=2.5):
     return runs
 
 
-def assemble(state, attribute_threshold=0.5, action_threshold=2.0, feedback=None, min_run=2):
+def box_features(observations):
+    """Size and placement of a result's boxes, for the learned scorer."""
+    boxes = [o["box"] for o in observations]
+    areas = [(x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in boxes]
+    edge = [min(x0, y0, 1 - x1, 1 - y1) <= 0.01 for x0, y0, x1, y1 in boxes]
+    return {"box_area": float(np.median(areas)), "edge": float(np.mean(edge))}
+
+
+def assemble(state, attribute_threshold=0.5, action_threshold=2.0, feedback=None, min_run=2, memory=None):
     """Turn the saved observations and clip scores into results, applying any feedback.
 
     `action_threshold` is a multiple of chance: a clip's action share times the number of descriptions.
+    Every result carries `features`, the measurements the learned scorer reads.
     """
     plan, shots_by_id = state["plan"], {shot["id"]: shot for shot in state["shots"]}
     scale = state["scale"]
-    positives, negatives = feedback_exemplars(state, feedback)
+    priority = state.get("shot_priority", {})
+    positives, negatives = feedback_exemplars(state, feedback, memory)
     use_feedback = bool(len(positives) or len(negatives))
 
     def baseline_for(embeddings):
@@ -438,15 +454,26 @@ def assemble(state, attribute_threshold=0.5, action_threshold=2.0, feedback=None
                 end = min(shot["end"], run[-1] + step / 2)
                 hits = [hit for time in run for hit in per_time[time]]
                 appearance = float(max(np.mean([o["final"] for o in t["observations"]]) for t, _ in hits))
+                # When appearance does not decide, it only nudges: a poorly worded pose must not make a
+                # clip the motion scoring found look like a 4% guess.
+                confidence = appearance if gate_on_appearance or not plan["target"] else 0.5 + 0.5 * appearance
+                identities = sorted({t["identity"] for t, _ in hits})
+                count = max(len(per_time[time]) for time in run)
                 candidates.append({
-                    "shot": shot_id, "start": start, "end": end,
-                    # When appearance does not decide, it only nudges: a poorly worded pose must not make a
-                    # clip the motion scoring found look like a 4% guess.
-                    "confidence": appearance if gate_on_appearance or not plan["target"] else 0.5 + 0.5 * appearance,
-                    "identities": sorted({t["identity"] for t, _ in hits}),
-                    "count": max(len(per_time[time]) for time in run),
+                    "shot": shot_id, "start": start, "end": end, "confidence": confidence,
+                    "identities": identities, "count": count,
                     "evidence": max(hits, key=lambda hit: hit[1]["final"]),
                     "exemplars": [o["embedding"] for _, o in hits][:12],
+                    "features": {
+                        "appearance": appearance, "peak_probability": max(o["final"] for _, o in hits),
+                        "detector_score": float(np.mean([o["score"] for _, o in hits])),
+                        "samples": len(run), "duration": end - start,
+                        "shot_share": (end - start) / max(1e-6, shot["end"] - shot["start"]),
+                        **box_features([o for _, o in hits]), "count": count, "identities": len(identities),
+                        "track_length": max(len(t["observations"]) for t, _ in hits),
+                        "has_object": 1, "has_target": int(bool(plan["target"])), "has_action": int(bool(plan["action"])),
+                        "shot_priority": priority.get(shot_id, 0.0),
+                    },
                 })
     if plan["action"]:
         # A clip's action score is a share of probability among every description offered, so what it
@@ -466,6 +493,8 @@ def assemble(state, attribute_threshold=0.5, action_threshold=2.0, feedback=None
                     candidate["start"] = max(candidate["start"], min(w["start"] for w in overlapping))
                     candidate["end"] = min(candidate["end"], max(w["end"] for w in overlapping))
                     candidate["confidence"] *= strength(overlapping)
+                    candidate["features"]["action_lift"] = max(lift(w) for w in overlapping)
+                    candidate["features"]["duration"] = candidate["end"] - candidate["start"]
                     kept.append(candidate)
             candidates = kept
         else:
@@ -478,12 +507,21 @@ def assemble(state, attribute_threshold=0.5, action_threshold=2.0, feedback=None
                         merged[-1]["windows"].append(window)
                     else:
                         merged.append({"start": window["start"], "end": window["end"], "windows": [window]})
+                shot = shots_by_id[shot_id]
                 for run in merged:
+                    confidence = float(strength(run["windows"]))
                     candidates.append({
-                        "shot": shot_id, "start": run["start"], "end": run["end"],
-                        "confidence": float(strength(run["windows"])),
+                        "shot": shot_id, "start": run["start"], "end": run["end"], "confidence": confidence,
                         "identities": [], "count": 0, "evidence": None,
                         "exemplars": [w["embedding"] for w in run["windows"]][:12],
+                        "features": {
+                            "appearance": 0.0, "peak_probability": max(w["final"] for w in run["windows"]),
+                            "samples": len(run["windows"]), "duration": run["end"] - run["start"],
+                            "shot_share": (run["end"] - run["start"]) / max(1e-6, shot["end"] - shot["start"]),
+                            "action_lift": max(lift(w) for w in run["windows"]),
+                            "has_object": 0, "has_target": 0, "has_action": 1,
+                            "shot_priority": priority.get(shot_id, 0.0),
+                        },
                     })
 
     # Join results either side of a boundary that a track was seen to continue across.
@@ -498,19 +536,65 @@ def assemble(state, attribute_threshold=0.5, action_threshold=2.0, feedback=None
             previous["confidence"] = max(previous["confidence"], candidate["confidence"])
             previous["identities"] = sorted(set(previous["identities"]) | set(candidate["identities"]))
             previous["exemplars"] = (previous["exemplars"] + candidate["exemplars"])[:12]
+            first, second = previous["features"], candidate["features"]
+            previous["features"] = {**{key: max(first.get(key, 0), second.get(key, 0)) for key in {*first, *second}},
+                                    "samples": first.get("samples", 0) + second.get("samples", 0),
+                                    "duration": previous["end"] - previous["start"],
+                                    "identities": len(previous["identities"])}
             continue
         joined.append(candidate)
-    for number, candidate in enumerate(joined):
+    for candidate in joined:
         candidate["match_key"] = f"{candidate['shot']}:{candidate['start']:.2f}"
+        candidate["features"]["rule_confidence"] = candidate["confidence"]
     return joined
+
+
+# How far below the hand-set thresholds a result may fall and still be offered to the learned scorer.
+NEAR_MISS_ATTRIBUTE = 0.6
+NEAR_MISS_ACTION = 0.65
+
+
+def propose(state, feedback=None, memory=None, scorer=None):
+    """The results to show: the rules' results, or once a learned scorer beats the rules, its choice.
+
+    With a scorer, results that just missed the thresholds are considered too, so what the scorer has
+    learned can recover them as well as reject the rules' false positives.
+    """
+    thresholds = state["thresholds"]
+    strict = assemble(state, thresholds["attribute"], thresholds["action"], feedback=feedback, memory=memory)
+    for candidate in strict:
+        candidate["features"]["rule_pass"] = 1
+        candidate["rule_pass"] = True
+        candidate["decided_by"] = "rules"
+    if scorer is None:
+        return strict
+    relaxed = assemble(state, thresholds["attribute"] * NEAR_MISS_ATTRIBUTE, thresholds["action"] * NEAR_MISS_ACTION,
+                       feedback=feedback, memory=memory)
+    near =[c for c in relaxed if not any(mostly_inside(c, s) or mostly_inside(s, c) for s in strict)]
+    for candidate in near:
+        candidate["features"]["rule_pass"] = 0
+        candidate["rule_pass"] = False
+    kept = []
+    for candidate in strict + near:
+        probability = scorer.probability(candidate["features"])
+        candidate["learned_probability"] = probability
+        candidate["decided_by"] = "learned"
+        if scorer.keeps(candidate["features"], probability):
+            candidate["confidence"] = probability
+            kept.append(candidate)
+    return sorted(kept, key=lambda c: c["start"])
 
 
 # ------------------------------------------------------------------- search
 
 def detect_search(query, resources, output_root, max_frames=400, detect_fps=2.0, box_threshold=0.3,
                   attribute_threshold=0.5, action_threshold=2.0, final_frame_fps=1.0, max_frames_per_match=8,
-                  plan=None):
-    """Answer `query` for one video by detection, tracking and clip scoring; saves state for feedback."""
+                  plan=None, learner=None, search_id=None):
+    """Answer `query` for one video by detection, tracking and clip scoring; saves state for feedback.
+
+    `learner` (a feedback_learning.Learner) supplies marks remembered from earlier searches and, once it
+    beats the hand-set thresholds, the learned scorer that decides which results to keep.
+    """
     from .shots import shot_index
 
     manifest = resources.manifest
@@ -623,8 +707,9 @@ def detect_search(query, resources, output_root, max_frames=400, detect_fps=2.0,
         "shots": [{key: shot[key] for key in ("id", "start", "end")} for shot in shots],
         "shot_fps": shot_fps, "bridged": bridged, "thresholds": {"attribute": attribute_threshold, "action": action_threshold},
         "video_duration": float(manifest["video"]["duration"]),
+        "shot_priority": {shot["id"]: float(p) for shot, p in ranked},
     }
-    candidates = assemble(state, attribute_threshold, action_threshold)
+    candidates, learning = learned_candidates(state, None, learner, search_id)
     state["last_matches"] = candidates
     diagnostics = {
         "num_shots": len(shots), "num_examined_shots": len(examined), "frames_examined": frames_used,
@@ -633,7 +718,21 @@ def detect_search(query, resources, output_root, max_frames=400, detect_fps=2.0,
         "bridged_boundaries": sorted(bridged), "shot_ranking": [(shot["id"], round(p, 3)) for shot, p in ranked],
     }
     state["diagnostics"] = diagnostics
-    return finish(state, candidates, output_root, video_path, manifest, final_frame_fps, max_frames_per_match, diagnostics)
+    return finish(state, candidates, output_root, video_path, manifest, final_frame_fps, max_frames_per_match,
+                  {**diagnostics, "learning": learning})
+
+
+def learned_candidates(state, feedback, learner, search_id):
+    """Propose results with whatever the learner knows, and say how they were decided."""
+    memory = learner.memory(state["plan"], exclude_search=search_id) if learner else None
+    scorer = learner.scorer() if learner else None
+    candidates = propose(state, feedback=feedback, memory=memory, scorer=scorer)
+    return candidates, {
+        "decided_by": "learned" if scorer else "rules",
+        "model_version": scorer.version if scorer else None,
+        "near_misses_kept": sum(1 for c in candidates if not c.get("rule_pass", True)),
+        "remembered": {"right": int(len(memory[0])), "wrong": int(len(memory[1]))} if memory is not None else None,
+    }
 
 
 def finish(state, candidates, output_root, video_path, manifest, final_frame_fps, max_frames_per_match, diagnostics):
@@ -645,6 +744,8 @@ def finish(state, candidates, output_root, video_path, manifest, final_frame_fps
         "start": c["start"], "end": c["end"], "confidence": c["confidence"], "match_key": c["match_key"],
         "shot": c["shot"], "identities": c["identities"], "count": c["count"],
         "description": describe(state["plan"], c),
+        "decided_by": c.get("decided_by", "rules"), "near_miss": not c.get("rule_pass", True),
+        "rule_confidence": c.get("features", {}).get("rule_confidence", c["confidence"]),
     } for c in candidates]
     matches, result_file = materialize_final_matches(manifest, instances, state["query"], output_root=str(output_root),
                                                      frame_fps=final_frame_fps, max_frames_per_match=max_frames_per_match)
@@ -713,13 +814,34 @@ def mostly_inside(candidate, other, share=0.5):
     return overlap >= share * max(1e-6, candidate["end"] - candidate["start"])
 
 
-def refine(output_root, feedback, resources, final_frame_fps=1.0, max_frames_per_match=8):
+def example_for(output_root, match_key):
+    """What the learner stores for a mark on one result: its measurements and what was inside it."""
+    try:
+        with open(Path(output_root) / "detect_state.pkl", "rb") as file:
+            state = pickle.load(file)
+    except Exception:  # a missing or unreadable state only means this mark cannot be learned from
+        return None
+    from .feedback_learning import concept_key
+
+    match = next((c for c in state.get("last_matches", []) if c["match_key"] == match_key), None)
+    if match is None or "features" not in match:
+        return None  # a search saved before results carried measurements
+    exemplars = np.asarray(match.get("exemplars") or [], dtype=np.float32)
+    embedding = None
+    if len(exemplars):
+        mean = exemplars.mean(axis=0)
+        embedding = (mean / max(float(np.linalg.norm(mean)), 1e-8)).astype(np.float16)
+    return {"features": {**match["features"], "rule_pass": int(match.get("rule_pass", True))},
+            "embedding": embedding, "concept": concept_key(state["plan"]), "query": state["query"],
+            "start": match["start"], "end": match["end"]}
+
+
+def refine(output_root, feedback, resources, final_frame_fps=1.0, max_frames_per_match=8, learner=None, search_id=None):
     """Re-score a saved Detect search with the user's marks, without running the detector again."""
     output_root = Path(output_root)
     with open(output_root / "detect_state.pkl", "rb") as file:
         state = pickle.load(file)
-    thresholds = state["thresholds"]
-    candidates = assemble(state, thresholds["attribute"], thresholds["action"], feedback=feedback)
+    candidates, learning = learned_candidates(state, feedback, learner, search_id)
     # Marked results keep their verdict whatever the re-scoring says about their neighbours.
     previous = {c["match_key"]: c for c in state["last_matches"]}
     keys = {c["match_key"] for c in candidates}
@@ -732,7 +854,8 @@ def refine(output_root, feedback, resources, final_frame_fps=1.0, max_frames_per
                   and not any(mostly_inside(c, r) for r in rejected)]
     candidates.sort(key=lambda c: c["start"])
     state["last_matches"] = candidates + [c for key, c in previous.items() if key not in {x["match_key"] for x in candidates}]
-    diagnostics = {**state.get("diagnostics", {}), "refined_with": {label: sum(1 for v in (feedback or {}).values() if v == label)
+    diagnostics = {**state.get("diagnostics", {}), "learning": learning,
+                   "refined_with": {label: sum(1 for v in (feedback or {}).values() if v == label)
                                     for label in ("positive", "negative")}}
     manifest = resources.manifest
     return finish(state, candidates, output_root, manifest["video"]["path"], manifest, final_frame_fps,

@@ -158,11 +158,17 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(self.client.post(f"{url}/refine", headers=HEADERS).status_code, 400)   # nothing marked yet
         self.assertEqual(self.client.post(f"{url}/feedback", json={"match_key": "9:9.99", "label": "positive"}, headers=HEADERS).status_code, 400)
         self.assertEqual(self.client.post(f"{url}/feedback", json={"match_key": "0:1.00", "label": "maybe"}, headers=HEADERS).status_code, 400)
-        marked = self.client.post(f"{url}/feedback", json={"match_key": "0:1.00", "label": "positive"}, headers=HEADERS).json()
-        self.client.post(f"{url}/feedback", json={"match_key": "2:7.50", "label": "negative"}, headers=HEADERS)
-        cleared = self.client.post(f"{url}/feedback", json={"match_key": "2:7.50", "label": None}, headers=HEADERS).json()
+        example = {"features": {"box_area": 0.1, "rule_pass": 1}, "embedding": None, "concept": "person", "query": "q"}
+        with patch("webapp.service.example_for", return_value=example) as example_for:
+            marked = self.client.post(f"{url}/feedback", json={"match_key": "0:1.00", "label": "positive"}, headers=HEADERS).json()
+            self.client.post(f"{url}/feedback", json={"match_key": "2:7.50", "label": "negative"}, headers=HEADERS)
+            self.assertEqual(self.client.get("/api/learning").json()["examples"], 2)
+            cleared = self.client.post(f"{url}/feedback", json={"match_key": "2:7.50", "label": None}, headers=HEADERS).json()
+        self.assertEqual(example_for.call_count, 2)   # clearing a mark needs no example
         self.assertEqual(marked["feedback"], {"0:1.00": "positive"})
         self.assertEqual(cleared["feedback"], {"0:1.00": "positive"})
+        self.assertEqual((cleared["learning"]["examples"], cleared["learning"]["state"]), (1, "collecting"))
+        self.assertEqual(self.service.learner.examples[f"{video['id']}/{search['id']}/0:1.00"]["label"], 1)
 
         response = self.client.post(f"{url}/refine", headers=HEADERS)
         self.assertEqual(response.status_code, 202)
@@ -170,6 +176,7 @@ class WebAppTest(unittest.TestCase):
 
         def fake_refine(output_root, feedback, resources, **kwargs):
             self.assertEqual(feedback, {"0:1.00": "positive"})
+            self.assertIs(kwargs["learner"], self.service.learner)
             return self.detect_result(output_root, ["0:1.00"])
 
         with patch("video_retrieval.detect_search.refine", side_effect=fake_refine):
