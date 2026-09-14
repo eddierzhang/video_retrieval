@@ -20,6 +20,14 @@ VISUAL_TILE_GRID = 2
 # Scene descriptions and transcripts are prose, which CLIP's 77-token caption
 # encoder handles poorly; they get a dedicated text embedder instead.
 TEXT_EMBEDDING_MODEL = "nomic-embed-text"
+
+# Detect search. An open-vocabulary detector finds every instance of a generic category in
+# every sampled frame; crops are then scored against the distinguishing attribute with the
+# visual model above; motion is scored per short clip with a video-text model. All Apache 2.0
+# or MIT licensed, downloaded once into MODEL_CACHE_DIR.
+DETECTOR_MODEL = "IDEA-Research/grounding-dino-tiny"
+ACTION_MODEL = "microsoft/xclip-base-patch32"
+ACTION_CLIP_FRAMES = 8
 WHISPER_MODEL = "base"
 
 # One multimodal model can serve every role, which avoids swapping models on the GPU.

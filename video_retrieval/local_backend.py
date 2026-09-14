@@ -26,7 +26,10 @@ import requests
 from tqdm import tqdm
 
 from .config import (
+    ACTION_CLIP_FRAMES,
+    ACTION_MODEL,
     CACHE_DIR,
+    DETECTOR_MODEL,
     DEFAULT_PLANNER_MODEL,
     DEFAULT_VERIFIER_MODEL,
     DEFAULT_VISION_MODEL,
@@ -305,6 +308,17 @@ def encode(images=None, text=None):
     return features.cpu().numpy()
 
 
+def visual_logit_scale():
+    """The temperature the visual model was trained with, for softmax over competing texts.
+
+    Its sigmoid pair probabilities are not used: on tight crops scored against short phrases they
+    sit near zero for every crop, matching or not. A softmax over mutually exclusive descriptions
+    separates crops cleanly instead.
+    """
+    torch, _, model, _, _ = visual_model()
+    return float(model.logit_scale.exp().detach().float().cpu())
+
+
 def embed_text(text):
     # Mean-pool 40-word pieces so long text is not truncated by the model's context.
     words = str(text).split()
@@ -426,6 +440,136 @@ def _encode_frame_views(frames):
     views = [view for frame in frames for view in frame_views(frame)]
     features = encode(images=views)
     return features.reshape(len(frames), -1, features.shape[-1])
+
+
+def decode_frames(video_path, start, end, fps, max_side=800):
+    """RGB frames from [start, end) at `fps`, decoded in order so any container works: [(time, frame)].
+
+    OpenCV cannot seek reliably inside WebM, so this reads through FFmpeg instead.
+    """
+    from .video import probe_video
+
+    info = probe_video(video_path)
+    if not info["width"] or not info["height"]:
+        raise ValueError(f"No video stream in {video_path}")
+    scale = min(1.0, max_side / max(info["width"], info["height"]))
+    width = max(2, round(info["width"] * scale / 2) * 2)
+    height = max(2, round(info["height"] * scale / 2) * 2)
+    start = max(0.0, float(start))
+    duration = max(0.0, float(end) - start)
+    if duration <= 0:
+        return []
+    command = [
+        "ffmpeg", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(video_path),
+        "-an", "-sn", "-vf", f"fps={fps},scale={width}:{height}:flags=area",
+        "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
+    ]
+    frame_bytes = width * height * 3
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    frames = []
+    try:
+        for index, data in enumerate(iter(lambda: process.stdout.read(frame_bytes), b"")):
+            if len(data) < frame_bytes:
+                break
+            check_cancelled()
+            frames.append((start + index / fps, np.frombuffer(data, np.uint8).reshape(height, width, 3)))
+        process.wait()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    return frames
+
+
+@lru_cache(maxsize=1)
+def detector_model():
+    """The open-vocabulary object detector used by Detect search."""
+    import torch
+    from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    kwargs = dict(cache_dir=str(MODEL_CACHE_DIR))
+    try:
+        processor = AutoProcessor.from_pretrained(DETECTOR_MODEL, local_files_only=True, **kwargs)
+        model = AutoModelForZeroShotObjectDetection.from_pretrained(DETECTOR_MODEL, local_files_only=True, **kwargs)
+    except OSError:
+        processor = AutoProcessor.from_pretrained(DETECTOR_MODEL, **kwargs)
+        model = AutoModelForZeroShotObjectDetection.from_pretrained(DETECTOR_MODEL, **kwargs)
+    return torch, processor, model.to(device).eval(), device
+
+
+def detect_objects(frames, phrases, box_threshold=0.3, text_threshold=0.25, batch_size=4):
+    """Boxes for every instance of any phrase in each RGB frame.
+
+    Returns one list per frame of {"box": [x0, y0, x1, y1] as fractions of the frame, "score", "label"}.
+    """
+    from PIL import Image
+
+    torch, processor, model, device = detector_model()
+    report(model=DETECTOR_MODEL, role="detector")
+    # Grounding DINO reads a lower-case prompt of phrases, each ending in a full stop.
+    prompt = " ".join(f"{phrase.strip().lower().rstrip('.')}." for phrase in phrases if phrase.strip())
+    output = []
+    for begin in range(0, len(frames), batch_size):
+        check_cancelled()
+        batch = frames[begin:begin + batch_size]
+        images = [Image.fromarray(frame) for frame in batch]
+        inputs = processor(images=images, text=[prompt] * len(images), return_tensors="pt").to(device)
+        with torch.inference_mode():
+            outputs = model(**inputs)
+        results = processor.post_process_grounded_object_detection(
+            outputs, inputs.input_ids, threshold=box_threshold, text_threshold=text_threshold,
+            target_sizes=[image.size[::-1] for image in images])
+        for image, result in zip(images, results):
+            width, height = image.size
+            labels = result.get("text_labels", result.get("labels"))
+            boxes = []
+            for box, score, label in zip(result["boxes"].tolist(), result["scores"].tolist(), labels):
+                x0, y0, x1, y1 = box
+                boxes.append({"box": [max(0.0, x0 / width), max(0.0, y0 / height), min(1.0, x1 / width), min(1.0, y1 / height)],
+                              "score": float(score), "label": str(label)})
+            output.append(boxes)
+    return output
+
+
+@lru_cache(maxsize=1)
+def action_model():
+    """The video-text model that scores motion over short clips rather than still frames."""
+    import torch
+    from transformers import XCLIPModel, XCLIPProcessor
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    kwargs = dict(cache_dir=str(MODEL_CACHE_DIR))
+    try:
+        processor = XCLIPProcessor.from_pretrained(ACTION_MODEL, local_files_only=True, **kwargs)
+        model = XCLIPModel.from_pretrained(ACTION_MODEL, local_files_only=True, **kwargs)
+    except OSError:
+        processor = XCLIPProcessor.from_pretrained(ACTION_MODEL, **kwargs)
+        model = XCLIPModel.from_pretrained(ACTION_MODEL, **kwargs)
+    return torch, processor, model.to(device).eval(), device
+
+
+def action_probabilities(clips, texts, batch_size=4):
+    """For each clip of ACTION_CLIP_FRAMES RGB frames, a softmax over `texts`: (clips, texts).
+
+    X-CLIP conditions each text on the clip it is compared with, so the whole comparison runs
+    through the model rather than as a dot product of separately computed embeddings.
+    """
+    torch, processor, model, device = action_model()
+    report(model=ACTION_MODEL, role="action")
+    rows = []
+    for begin in range(0, len(clips), batch_size):
+        check_cancelled()
+        batch = [list(clip)[:ACTION_CLIP_FRAMES] for clip in clips[begin:begin + batch_size]]
+        # The tokenizer and the video processor are called separately: the combined processor
+        # silently drops `videos=` in recent transformers releases.
+        inputs = dict(processor.tokenizer(list(texts), return_tensors="pt", padding=True))
+        inputs["pixel_values"] = processor.image_processor(images=batch, return_tensors="pt")["pixel_values"]
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+        with torch.inference_mode():
+            logits = model(**inputs).logits_per_video
+        rows.append(logits.softmax(dim=-1).float().cpu().numpy())
+    return np.concatenate(rows) if rows else np.zeros((0, len(texts)))
 
 
 def embed_video_interval(video_path, start, end):
