@@ -28,6 +28,8 @@ export const api = {
   createSearch: (id, body) => request('POST', `${videoUrl(id)}/searches`, body),
   search: (id, searchId) => request('GET', `${videoUrl(id)}/searches/${encodeURIComponent(searchId)}`),
   deleteSearch: (id, searchId) => request('DELETE', `${videoUrl(id)}/searches/${encodeURIComponent(searchId)}`),
+  searchFeedback: (id, searchId, body) => request('POST', `${videoUrl(id)}/searches/${encodeURIComponent(searchId)}/feedback`, body),
+  refineSearch: (id, searchId) => request('POST', `${videoUrl(id)}/searches/${encodeURIComponent(searchId)}/refine`),
   cancelJob: (jobId) => request('POST', `/api/jobs/${encodeURIComponent(jobId)}/cancel`),
 };
 

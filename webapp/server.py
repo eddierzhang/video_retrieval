@@ -144,6 +144,17 @@ def create_app(service=None, allowed_hosts=None):
             return JSONResponse({"deleted": search_id})
         return JSONResponse(service.search(video_id, search_id))
 
+    async def feedback(request):
+        params = request.path_params
+        data = await body_json(request)
+        return JSONResponse(await run_in_threadpool(
+            service.set_feedback, params["video_id"], params["search_id"], data.get("match_key"), data.get("label")))
+
+    async def refine(request):
+        params = request.path_params
+        service.start_refine(params["video_id"], params["search_id"])
+        return JSONResponse(service.search(params["video_id"], params["search_id"]), status_code=202)
+
     async def search_file(request):
         params = request.path_params
         return FileResponse(library.search_file(params["video_id"], params["search_id"], params["path"]))
@@ -173,6 +184,8 @@ def create_app(service=None, allowed_hosts=None):
         Route("/api/videos/{video_id}/transcript", transcript),
         Route("/api/videos/{video_id}/searches", searches, methods=["GET", "POST"]),
         Route("/api/videos/{video_id}/searches/{search_id}", search, methods=["GET", "DELETE"]),
+        Route("/api/videos/{video_id}/searches/{search_id}/feedback", feedback, methods=["POST"]),
+        Route("/api/videos/{video_id}/searches/{search_id}/refine", refine, methods=["POST"]),
         Route("/api/videos/{video_id}/searches/{search_id}/files/{path:path}", search_file),
         Route("/api/jobs", jobs),
         Route("/api/jobs/{job_id}/cancel", cancel_job, methods=["POST"]),

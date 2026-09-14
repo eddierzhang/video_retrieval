@@ -11,7 +11,8 @@ import threading
 import time
 
 from video_retrieval.config import DATA_DIR
-from video_retrieval.local_backend import LocalModels, capabilities, check_runtime, devices, installed_models, installed_names
+from video_retrieval.detect_search import DETECT_STAGES
+from video_retrieval.local_backend import LocalModels, capabilities, check_runtime, devices, installed_models, installed_names, use_models
 from video_retrieval.config import TEXT_EMBEDDING_MODEL
 from video_retrieval.local_indexing import INDEX_STAGES, IndexVersionMismatch, index_key, load_index, prepare_video
 from video_retrieval.pipeline import SEARCH_STAGES
@@ -194,14 +195,17 @@ class Service:
             raise LibraryError("Describe what you are looking for.")
         if len(query) > 500:
             raise LibraryError("Keep the query under 500 characters.")
-        if mode not in ("verified", "quick"):
-            raise LibraryError("Search mode must be verified or quick.")
+        if mode not in ("verified", "quick", "detect"):
+            raise LibraryError("Search mode must be verified, quick or detect.")
         options = self._search_options(mode, options or {})
         search = self.library.create_search(video_id, {"query": query, "mode": mode, "options": options, "status": "queued"})
-        stages = [
-            stage for stage in SEARCH_STAGES
-            if not (stage in VERIFICATION_STAGES and (mode == "quick" or (stage == "Refining clip boundaries" and not options["refine_boundaries"])))
-        ]
+        if mode == "detect":
+            stages = list(DETECT_STAGES)
+        else:
+            stages = [
+                stage for stage in SEARCH_STAGES
+                if not (stage in VERIFICATION_STAGES and (mode == "quick" or (stage == "Refining clip boundaries" and not options["refine_boundaries"])))
+            ]
         job = Job(
             "search", video_id, query, stages,
             run=lambda job: self._run_search(job, search["id"]),
@@ -223,11 +227,15 @@ class Service:
                 raise LibraryError(f"{key} must be between {low} and {high}.")
             return value
 
-        return {
+        options = {
             "refine_boundaries": bool(raw.get("refine_boundaries", True)),
             "min_confidence": number("min_confidence", 0.25, 0.0, 1.0),
             "max_candidates": number("max_candidates", 12 if mode == "quick" else 20, 1, 50, int),
         }
+        if mode == "detect":
+            # How many frames the detector may examine, best-ranked shots first.
+            options["max_frames"] = number("max_frames", 400, 50, 3000, int)
+        return options
 
     def _run_search(self, job, search_id):
         search = self.library.update_search(job.video_id, search_id, status="running", started_at=time.time())
@@ -236,6 +244,17 @@ class Service:
         pipeline = self._pipeline(job.video_id)
         pipeline.resources.local_models = models
         options = search["options"]
+        output_root = self.library.search_dir(job.video_id, search_id)
+        if search["mode"] == "detect":
+            from video_retrieval.detect_search import detect_search
+
+            with use_models(models, job.report, job.cancel_event):
+                result = detect_search(search["query"], pipeline.resources, output_root,
+                                       max_frames=options.get("max_frames", 400), max_frames_per_match=8)
+            finished = time.time()
+            self.library.update_search(job.video_id, search_id, status="done", result=result,
+                                       finished_at=finished, elapsed=finished - search["started_at"])
+            return
         result = pipeline.retrieve(
             search["query"],
             reporter=job.report,
@@ -252,6 +271,66 @@ class Service:
         finished = time.time()
         self.library.update_search(job.video_id, search_id, status="done", result=result,
                                    finished_at=finished, elapsed=finished - search["started_at"])
+
+    def set_feedback(self, video_id, search_id, match_key, label):
+        """Mark one Detect result right ("positive"), wrong ("negative"), or clear the mark (None)."""
+        record = self.library.get_search(video_id, search_id)
+        if record.get("mode") != "detect":
+            raise LibraryError("Only Detect searches learn from feedback.")
+        if label not in ("positive", "negative", None):
+            raise LibraryError("Feedback must be positive, negative or empty.")
+        keys = {match.get("match_key") for match in (record.get("result") or {}).get("matches", [])}
+        known = set((record.get("feedback") or {}).keys()) | keys
+        if match_key not in known:
+            raise LibraryError("That result is not part of this search.")
+        feedback = dict(record.get("feedback") or {})
+        if label is None:
+            feedback.pop(match_key, None)
+        else:
+            feedback[match_key] = label
+        self.library.update_search(video_id, search_id, feedback=feedback)
+        return self.search(video_id, search_id)
+
+    def start_refine(self, video_id, search_id):
+        """Re-score a Detect search with its feedback, without running the detector again."""
+        record = self.library.get_search(video_id, search_id)
+        if record.get("mode") != "detect" or record.get("status") != "done":
+            raise LibraryError("Only a finished Detect search can be refined.")
+        if not record.get("feedback"):
+            raise LibraryError("Mark at least one result right or wrong first.")
+        if not (self.library.search_dir(video_id, search_id) / "detect_state.pkl").is_file():
+            raise LibraryError("This search has no saved state to refine; run it again.")
+        self.library.update_search(video_id, search_id, status="queued", error=None)
+        job = Job("search", video_id, record["query"], ["Assembling results", "Extracting matching clips"],
+                  run=lambda job: self._run_refine(job, search_id),
+                  on_finish=lambda job: self._refine_finished(job, search_id))
+        job.result = {"search_id": search_id}
+        self.library.update_search(video_id, search_id, job_id=job.id)
+        return self.jobs.submit(job)
+
+    def _run_refine(self, job, search_id):
+        from video_retrieval.detect_search import refine
+
+        search = self.library.update_search(job.video_id, search_id, status="running")
+        started = time.time()
+        pipeline = self._pipeline(job.video_id)
+        with use_models(self.settings(), job.report, job.cancel_event):
+            job.report({"stage": "Assembling results"})
+            result = refine(self.library.search_dir(job.video_id, search_id), search.get("feedback") or {},
+                            pipeline.resources, max_frames_per_match=8)
+        refinements = int(search.get("refinements") or 0) + 1
+        self.library.update_search(job.video_id, search_id, status="done", result=result, refinements=refinements,
+                                   finished_at=time.time(), elapsed=time.time() - started)
+
+    def _refine_finished(self, job, search_id):
+        # The earlier results are still valid, so a failed or cancelled refine keeps showing them.
+        if job.status == "done":
+            return
+        error = job.error if job.status == "failed" else "cancelled"
+        try:
+            self.library.update_search(job.video_id, search_id, status="done", error=error, finished_at=time.time())
+        except LibraryError:
+            pass
 
     def _search_finished(self, job, search_id):
         if job.status == "done":

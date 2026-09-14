@@ -127,6 +127,74 @@ class WebAppTest(unittest.TestCase):
         history = self.client.get(f"/api/videos/{video['id']}/searches").json()["searches"]
         self.assertEqual([row["status"] for row in history], ["done"])
 
+    def detect_result(self, output_root, keys):
+        evidence = Path(output_root) / "evidence" / "match.jpg"
+        evidence.parent.mkdir(parents=True, exist_ok=True)
+        evidence.write_bytes(b"jpg")
+        (Path(output_root) / "detect_state.pkl").write_bytes(b"state")
+        return {"query": "q", "mode": "detect", "verified": False, "num_matches": len(keys), "results_file": str(evidence),
+                "matches": [{"start": i, "end": i + 1, "confidence": 0.8, "match_key": key, "evidence_image_path": str(evidence)}
+                            for i, key in enumerate(keys)], "diagnostics": {}}
+
+    def test_detect_search_takes_feedback_and_refines(self):
+        video = self.indexed_video()
+        base = f"/api/videos/{video['id']}/searches"
+        too_many = {"query": "police officers", "mode": "detect", "options": {"max_frames": 99999}}
+        self.assertEqual(self.client.post(base, json=too_many, headers=HEADERS).status_code, 400)
+        search = self.client.post(base, json={"query": "police officers", "mode": "detect"}, headers=HEADERS).json()
+        self.assertEqual(search["options"]["max_frames"], 400)
+        self.assertIn("Detecting objects", search["job"]["stages"])
+        url = f"{base}/{search['id']}"
+
+        def fake_detect(query, resources, output_root, **kwargs):
+            return self.detect_result(output_root, ["0:1.00", "2:7.50"])
+
+        with patch("webapp.service.check_runtime"), patch("video_retrieval.detect_search.detect_search", side_effect=fake_detect):
+            job = self.jobs.run_next(timeout=1)
+        self.assertEqual(job.status, "done", job.error)
+        match = self.client.get(url).json()["result"]["matches"][0]
+        self.assertEqual(self.client.get(match["evidence_image_url"]).content, b"jpg")
+
+        self.assertEqual(self.client.post(f"{url}/refine", headers=HEADERS).status_code, 400)   # nothing marked yet
+        self.assertEqual(self.client.post(f"{url}/feedback", json={"match_key": "9:9.99", "label": "positive"}, headers=HEADERS).status_code, 400)
+        self.assertEqual(self.client.post(f"{url}/feedback", json={"match_key": "0:1.00", "label": "maybe"}, headers=HEADERS).status_code, 400)
+        marked = self.client.post(f"{url}/feedback", json={"match_key": "0:1.00", "label": "positive"}, headers=HEADERS).json()
+        self.client.post(f"{url}/feedback", json={"match_key": "2:7.50", "label": "negative"}, headers=HEADERS)
+        cleared = self.client.post(f"{url}/feedback", json={"match_key": "2:7.50", "label": None}, headers=HEADERS).json()
+        self.assertEqual(marked["feedback"], {"0:1.00": "positive"})
+        self.assertEqual(cleared["feedback"], {"0:1.00": "positive"})
+
+        response = self.client.post(f"{url}/refine", headers=HEADERS)
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "queued")
+
+        def fake_refine(output_root, feedback, resources, **kwargs):
+            self.assertEqual(feedback, {"0:1.00": "positive"})
+            return self.detect_result(output_root, ["0:1.00"])
+
+        with patch("video_retrieval.detect_search.refine", side_effect=fake_refine):
+            self.assertEqual(self.jobs.run_next(timeout=1).status, "done")
+        refined = self.client.get(url).json()
+        self.assertEqual((refined["status"], refined["refinements"], refined["result"]["num_matches"]), ("done", 1, 1))
+
+        self.client.post(f"{url}/refine", headers=HEADERS)
+        with patch("video_retrieval.detect_search.refine", side_effect=RuntimeError("out of memory")):
+            self.assertEqual(self.jobs.run_next(timeout=1).status, "failed")
+        after_failure = self.client.get(url).json()
+        # A failed refine leaves the earlier results in place.
+        self.assertEqual((after_failure["status"], after_failure["error"]), ("done", "out of memory"))
+        self.assertEqual(after_failure["result"]["num_matches"], 1)
+
+    def test_only_detect_searches_take_feedback(self):
+        video = self.indexed_video()
+        base = f"/api/videos/{video['id']}/searches"
+        search = self.client.post(base, json={"query": "a car", "mode": "quick"}, headers=HEADERS).json()
+        url = f"{base}/{search['id']}"
+        self.assertEqual(self.client.post(f"{url}/feedback", json={"match_key": "0:1.00", "label": "positive"}, headers=HEADERS).status_code, 400)
+        self.assertEqual(self.client.post(f"{url}/refine", headers=HEADERS).status_code, 400)
+        self.assertEqual(self.client.post(f"{url}/refine").status_code, 403)
+        self.assertEqual(self.client.post(base, json={"query": "a car", "mode": "fast"}, headers=HEADERS).status_code, 400)
+
     def test_failed_and_cancelled_indexing_update_the_video(self):
         video = self.upload(self.video_bytes()).json()
         with patch.object(Library, "make_preview"), patch("webapp.service.prepare_video", side_effect=RuntimeError("Ollama is not running")):

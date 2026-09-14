@@ -40,7 +40,7 @@ const state = {
   searchId: null,
   search: null,
   tab: 'plan',
-  mode: storage.get('moments.mode') === 'quick' ? 'quick' : 'verified',
+  mode: ['quick', 'detect'].includes(storage.get('moments.mode')) ? storage.get('moments.mode') : 'verified',
   activeMatch: -1,
   segmentEnd: null,
   overlayDismissed: new Set(),
@@ -403,7 +403,7 @@ function setMode(mode) {
   state.mode = mode;
   storage.set('moments.mode', mode);
   for (const button of els.modeButtons) button.setAttribute('aria-checked', String(button.dataset.mode === mode));
-  els.optRefine.disabled = mode === 'quick';
+  els.optRefine.disabled = mode !== 'verified';
   if (mode === 'quick' && Number(els.optCandidates.value) === 20) setCandidates(12);
   if (mode === 'verified' && Number(els.optCandidates.value) === 12) setCandidates(20);
 }
@@ -418,7 +418,10 @@ function renderResults() {
   const s = state.search;
   const job = s?.job;
   const key = [v.id, Boolean(v.index), v.jobs.length, s?.id, s?.status, s?.error,
-    job && ACTIVE.includes(s.status) ? [job.status, job.stage, job.stages, job.tasks, job.model, job.cancel_requested] : null];
+    job && ACTIVE.includes(s.status) ? [job.status, job.stage, job.stages, job.tasks, job.model, job.cancel_requested] : null,
+    s?.feedback, s?.refinements];
+  // A feedback mark redraws the same results, so keep the list where the user was reading.
+  const sameSearch = rendered.results && JSON.stringify(JSON.parse(rendered.results).slice(0, 6)) === JSON.stringify(key.slice(0, 6));
   if (!changed('results', key)) return;
   let content;
   if (!v.index) content = [lockedCard(v)];
@@ -427,8 +430,9 @@ function renderResults() {
   else if (s.status === 'failed') content = [issueCard(s, 'Search failed', s.error || 'Unknown error.')];
   else if (s.status === 'cancelled') content = [issueCard(s, 'Search cancelled', 'The search stopped before it finished.')];
   else content = resultsContent(s);
+  const scroll = els.results.scrollTop;
   els.results.replaceChildren(...content);
-  els.results.scrollTop = 0;
+  els.results.scrollTop = sameSearch ? scroll : 0;
 }
 
 function lockedCard(v) {
@@ -451,7 +455,9 @@ function introCard() {
       h('div', { class: 'mode-card' }, icon('shield', 18), h('div', {}, h('strong', {}, 'Verified'),
         'Checks each candidate with the local vision model and tightens the clip boundaries. Usually a minute or more.')),
       h('div', { class: 'mode-card' }, icon('bolt', 18), h('div', {}, h('strong', {}, 'Quick'),
-        'Ranks likely moments straight from the index in seconds. Results aren’t checked.'))));
+        'Ranks likely moments straight from the index in seconds. Results aren’t checked.')),
+      h('div', { class: 'mode-card' }, icon('film', 18), h('div', {}, h('strong', {}, 'Detect'),
+        'Finds every shot where something appears by detecting it frame by frame, with boxes as evidence. Mark results right or wrong to refine.'))));
 }
 
 function progressCard(s) {
@@ -466,9 +472,11 @@ function progressCard(s) {
       job ? h('button', { type: 'button', class: 'button button-ghost button-small', disabled: job.cancel_requested, onclick: () => cancelJob(job) },
         job.cancel_requested ? 'Stopping…' : 'Cancel') : null),
     job ? stepList(job) : null,
-    h('p', { class: 'progress-note' }, s.mode === 'verified'
-      ? 'Verified search checks candidates with the local vision model. Expect one to a few minutes.'
-      : 'Quick search ranks moments from the index without vision checks.'));
+    h('p', { class: 'progress-note' }, {
+      verified: 'Verified search checks candidates with the local vision model. Expect one to a few minutes.',
+      quick: 'Quick search ranks moments from the index without vision checks.',
+      detect: 'Detect search finds shots, then detects and tracks objects frame by frame. The first run downloads the detector.',
+    }[s.mode] ?? ''));
 }
 
 function issueCard(s, title, message) {
@@ -478,8 +486,15 @@ function issueCard(s, title, message) {
     h('button', { type: 'button', class: 'button button-ghost button-small', onclick: () => runSearch(s.query, s.mode) }, icon('refresh', 14), 'Run again'));
 }
 
+const MODES = {
+  verified: { icon: 'shield', label: 'Verified' },
+  quick: { icon: 'bolt', label: 'Quick' },
+  detect: { icon: 'film', label: 'Detect' },
+};
+
 function modeBadge(mode) {
-  return h('span', { class: 'mode-badge' }, icon(mode === 'quick' ? 'bolt' : 'shield', 13), mode === 'quick' ? 'Quick' : 'Verified');
+  const { icon: name, label } = MODES[mode] ?? MODES.verified;
+  return h('span', { class: 'mode-badge' }, icon(name, 13), label);
 }
 
 function resultsContent(s) {
@@ -499,21 +514,67 @@ function resultsContent(s) {
       h('div', { class: 'section-title' }, 'Text found'),
       result.text_entities.map((entity) => h('div', { class: 'entity' },
         h('span', { class: 'entity-text' }, entity.text),
-        h('span', { class: 'entity-meta' }, `${plural(entity.appearances.length, 'appearance')} · ${pct(entity.confidence)}`)))) : null);
+        h('span', { class: 'entity-meta' }, `${plural(entity.appearances.length, 'appearance')} · ${pct(entity.confidence)}`)))) : null,
+    s.mode === 'detect' ? feedbackBar(s) : null);
   if (!matches.length) {
-    return [summary, h('div', { class: 'card placeholder' }, icon('search', 22),
-      h('strong', {}, s.mode === 'verified' ? 'Nothing passed verification' : 'No likely moments found'),
-      h('p', {}, s.mode === 'verified'
-        ? 'Try describing it differently, lowering the minimum confidence, or running a Quick search to see near misses.'
-        : 'Try other wording, or describe what is visible or said.'))];
+    const empty = {
+      verified: ['Nothing passed verification', 'Try describing it differently, lowering the minimum confidence, or running a Quick search to see near misses.'],
+      quick: ['No likely moments found', 'Try other wording, or describe what is visible or said.'],
+      detect: ['Nothing was detected', 'Name the kind of thing to look for, such as a person, dog or car, and what sets it apart.'],
+    }[s.mode] ?? ['No moments found', 'Try other wording.'];
+    return [summary, h('div', { class: 'card placeholder' }, icon('search', 22), h('strong', {}, empty[0]), h('p', {}, empty[1]))];
   }
   return [summary, ...matches.map((match, index) => matchCard(match, index, s))];
+}
+
+function feedbackBar(s) {
+  const marks = Object.values(s.feedback || {});
+  const right = marks.filter((label) => label === 'positive').length;
+  const wrong = marks.filter((label) => label === 'negative').length;
+  const plan = s.result?.plan || {};
+  const looking = [plan.target || plan.object, plan.with_object && plan.with_count && `with ${plan.with_count} ${plan.with_object}`,
+    plan.action && (plan.object ? `while ${plan.action}` : plan.action)].filter(Boolean).join(', ');
+  return h('div', { class: 'feedback-bar' },
+    looking ? h('p', { class: 'feedback-plan' }, `Looked for: ${looking}`) : null,
+    s.error ? h('p', { class: 'feedback-error' }, `Refining failed: ${s.error}`) : null,
+    s.refinements ? h('p', { class: 'feedback-plan' }, `Refined ${plural(s.refinements, 'time')} with your marks.`) : null,
+    h('div', { class: 'feedback-row' },
+      h('span', { class: 'feedback-count' }, marks.length
+        ? `${plural(right, 'result')} marked right · ${wrong} wrong`
+        : 'Mark results right or wrong, then refine to find more like the right ones.'),
+      h('button', {
+        type: 'button', class: 'button button-primary button-small', disabled: !marks.length,
+        onclick: () => refineSearch(s),
+      }, icon('refresh', 14), 'Refine with feedback')));
+}
+
+async function markResult(s, match, label) {
+  const current = (s.feedback || {})[match.match_key];
+  try {
+    const updated = await api.searchFeedback(state.video.id, s.id, { match_key: match.match_key, label: current === label ? null : label });
+    state.search = { ...state.search, feedback: updated.feedback };
+    renderResults();
+  } catch (error) {
+    toast(error.message, 'error');
+  }
+}
+
+async function refineSearch(s) {
+  try {
+    state.search = await api.refineSearch(state.video.id, s.id);
+    state.activeMatch = -1;
+    render();
+    schedulePoll(400);
+  } catch (error) {
+    toast(error.message, 'error');
+  }
 }
 
 function matchCard(match, index, s) {
   const confidence = Number(match.confidence ?? 0);
   const frames = match.frames || [];
-  const thumbnail = match.best_frame_url || frames[Math.floor((frames.length - 1) / 2)]?.url;
+  const thumbnail = match.evidence_image_url || match.best_frame_url || frames[Math.floor((frames.length - 1) / 2)]?.url;
+  const mark = (s.feedback || {})[match.match_key];
   const description = match.description || 'Matching moment';
   const facts = [
     ['Who', match.actor_description],
@@ -537,7 +598,19 @@ function matchCard(match, index, s) {
       h('p', { class: 'match-desc' }, description),
       h('div', { class: 'meter' },
         h('span', { class: 'meter-track', 'aria-hidden': 'true' }, h('span', { class: 'meter-fill', style: { width: pct(Math.min(1, confidence)) } })),
-        h('span', {}, s.mode === 'quick' ? `Evidence ${pct(confidence)} · unverified` : `${pct(confidence)} confidence`)),
+        h('span', {}, {
+          quick: `Evidence ${pct(confidence)} · unverified`,
+          detect: `${pct(confidence)} match`,
+        }[s.mode] ?? `${pct(confidence)} confidence`)),
+      s.mode === 'detect' && match.match_key ? h('div', { class: 'feedback-buttons', role: 'group', 'aria-label': 'Was this result right?' },
+        h('button', {
+          type: 'button', class: `button button-ghost button-small${mark === 'positive' ? ' is-right' : ''}`,
+          'aria-pressed': String(mark === 'positive'), onclick: () => markResult(s, match, 'positive'),
+        }, icon('check', 14), 'Right'),
+        h('button', {
+          type: 'button', class: `button button-ghost button-small${mark === 'negative' ? ' is-wrong' : ''}`,
+          'aria-pressed': String(mark === 'negative'), onclick: () => markResult(s, match, 'negative'),
+        }, icon('x', 14), 'Wrong')) : null,
       hasDetails ? h('details', { class: 'match-details' },
         h('summary', {}, 'Evidence and clip', icon('chevron', 14)),
         h('div', { class: 'details-body' },
@@ -593,6 +666,41 @@ function stat(value, label) {
   return h('div', { class: 'stat' }, h('div', { class: 'stat-label' }, label), h('div', { class: 'stat-value', title: String(value) }, value));
 }
 
+function detectPlan(search, result, plan, d) {
+  const blocks = [h('div', { class: 'plan-summary' },
+    stat('Detect and track', 'Route'),
+    stat('Every occurrence', 'Returns'),
+    stat(formatElapsed(search.elapsed) || '—', search.refinements ? 'Last refine' : 'Search time'),
+    stat(d.num_examined_shots != null ? `${d.num_examined_shots} of ${d.num_shots}` : '—', 'Shots examined'))];
+  if (plan.planning_error) blocks.push(section('Planner unavailable', h('p', {}, `Searched for the query as a motion instead: ${plan.planning_error}`)));
+  const rows = [
+    ['Detects', plan.object],
+    ['Looks like', plan.target],
+    ['Rather than', plan.contrasts?.join('; ')],
+    ['How many', plan.min_count > 1 ? `At least ${plan.min_count} at once` : null],
+    ['Carrying', plan.with_object && plan.with_count ? `${plan.with_count} ${plan.with_object}` : null],
+    ['Motion', plan.action],
+    ['Rather than', plan.action_contrasts?.join('; ')],
+  ].filter(([, value]) => value);
+  blocks.push(section('What it looked for', h('dl', { class: 'facts facts-wide' }, rows.flatMap(([label, value]) => [h('dt', {}, label), h('dd', {}, value)]))));
+  const steps = [
+    [d.num_shots, 'Shots'],
+    [d.frames_examined, 'Frames detected'],
+    [d.num_tracks, 'Tracks'],
+    [d.num_identities, 'Distinct things'],
+    [result.num_matches, 'Returned'],
+  ].filter(([n]) => n != null);
+  if (steps.length) blocks.push(section('Search funnel', h('div', { class: 'funnel' }, steps.map(([n, label]) => funnelStep(n, label)))));
+  if (d.unexamined_shots?.length) {
+    blocks.push(section('Not examined', h('p', {},
+      `${plural(d.unexamined_shots.length, 'shot')} ranked lowest were skipped to stay within the frame budget: `
+      + d.unexamined_shots.map((shot) => `${preciseTime(shot.start)}–${preciseTime(shot.end)}`).join(', '))));
+  }
+  const marks = d.refined_with;
+  if (marks) blocks.push(section('Feedback applied', h('p', {}, `${plural(marks.positive, 'result')} marked right and ${marks.negative} wrong re-scored every detection, without detecting again.`)));
+  return blocks;
+}
+
 function renderPlan() {
   const search = state.search;
   const result = search?.status === 'done' ? search.result : null;
@@ -605,6 +713,10 @@ function renderPlan() {
   }
   const plan = result.plan || {};
   const d = result.diagnostics || {};
+  if (plan.executor === 'detect') {
+    els.tabPanel.replaceChildren(...detectPlan(search, result, plan, d));
+    return;
+  }
   const textRoute = plan.executor === 'visual_text_extraction';
   const models = result.model_backend || {};
   const blocks = [h('div', { class: 'plan-summary' },
