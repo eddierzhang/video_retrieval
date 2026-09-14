@@ -159,6 +159,28 @@ class LocalArchitectureTest(unittest.TestCase):
         # With no ordering to enforce, candidates come back untouched.
         self.assertEqual(apply_temporal_ordering(candidates, results, {}), candidates)
 
+    def test_planner_returns_every_match_unless_one_is_asked_for(self):
+        from video_retrieval.retrieval import resolve_return_mode
+
+        # The planner's "best" is overridden whenever the request does not ask for one occurrence.
+        self.assertEqual(resolve_return_mode("find clips with police officers in them", "best"), "all")
+        self.assertEqual(resolve_return_mode("when does someone get out of the car", "best"), "all")
+        self.assertEqual(resolve_return_mode("find every dog", "all"), "all")
+        self.assertEqual(resolve_return_mode("anything", None), "all")
+        # An explicit request for a single occurrence is respected.
+        self.assertEqual(resolve_return_mode("the first time the ball is served", "best"), "best")
+        self.assertEqual(resolve_return_mode("show me the best dunk", "best"), "best")
+        self.assertEqual(resolve_return_mode("only one clip of the sign", "best"), "best")
+        # Words that merely contain a single-answer word do not count.
+        self.assertEqual(resolve_return_mode("a firstborn calf and a blasted wall", "best"), "all")
+
+        raw = {"executor": "temporal_grounding", "return_mode": "best",
+               "weights": {"video": 1, "metadata": 0, "transcript_semantic": 0, "transcript_bm25": 0},
+               "evidence_predicates": [{"id": "a", "description": "a uniformed officer", "role": "target",
+                                        "modalities": ["video"], "required": True, "importance": 0.9}]}
+        with patch.object(local, "chat_json", return_value=dict(raw)):
+            self.assertEqual(plan_query("find clips with police officers in them")["return_mode"], "all")
+
     def test_planner_keeps_only_ordering_between_real_predicates(self):
         raw = {
             "executor": "temporal_grounding",

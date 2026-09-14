@@ -10,10 +10,27 @@ ORDERING_VIOLATED_PENALTY = 0.75
 from . import local_backend
 
 import math
+import re
 
 from .embeddings import search_video
 from .metadata import search_metadata
 from .transcript import search_transcript_bm25, search_transcript_semantic
+
+# Words that ask for one occurrence rather than every one.
+SINGLE_ANSWER = re.compile(r"\b(first|last|earliest|latest|best|single|only one|just one)\b", re.IGNORECASE)
+
+
+def resolve_return_mode(query, planned):
+    """Every match by default; a single one only when the planner and the request both ask for it.
+
+    The planner often answers "best" for plural requests such as "find clips with police officers",
+    which silently drops every occurrence after the first, so its choice is kept only when the
+    request itself asks for one.
+    """
+    if planned == "best" and SINGLE_ANSWER.search(str(query or "")):
+        return "best"
+    return "all"
+
 
 #Turns natural language query into a structured prompt
 def plan_query(query):
@@ -149,8 +166,10 @@ Whenever the request involves something said, include transcript predicates
 rather than relying on a single whole-query embedding.
 
 General planning rules:
-- If the request says all/every/each/every time/every instance or otherwise asks
-  for exhaustive results, set return_mode="all"; otherwise use "best".
+- Set return_mode="all" by default: return every occurrence that matches, even when the
+  request does not say "all" or "every" ("find clips with dogs", "when does she laugh").
+  Use return_mode="best" only when the request explicitly asks for a single occurrence
+  ("the first time", "the last goal", "the best shot", "only one").
 - For temporal_grounding, generate multiple high-recall queries per relevant
   channel and weights that sum to 1.
 - For visual_text_extraction, set retrieval weights to 0; it has its own
@@ -331,6 +350,7 @@ General planning rules:
     }
 
     plan = local_backend.chat_json(prompt + "\nPlan only this user request: " + query, schema, role="planner")
+    plan["return_mode"] = resolve_return_mode(query, plan.get("return_mode"))
 
     #Type of query
     if plan.get("executor") == "visual_text_extraction":
