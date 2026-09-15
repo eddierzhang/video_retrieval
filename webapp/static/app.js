@@ -20,7 +20,7 @@ const els = {
   systemPill: byId('system-pill'), banner: byId('banner'), empty: byId('empty-state'), emptyChoose: byId('empty-choose'),
   workspace: byId('workspace'), title: byId('video-title'), meta: byId('video-meta'), actions: byId('video-actions'),
   form: byId('search-form'), input: byId('search-input'), submit: byId('search-submit'), options: byId('search-options'),
-  modeButtons: [...document.querySelectorAll('[data-mode]')], optRefine: byId('opt-refine'),
+  modeButtons: [...document.querySelectorAll('[data-mode]')], optRefine: byId('opt-refine'), optVision: byId('opt-vision'),
   optConfidence: byId('opt-confidence'), optConfidenceOut: byId('opt-confidence-out'),
   optCandidates: byId('opt-candidates'), optCandidatesOut: byId('opt-candidates-out'),
   video: byId('video'), overlay: byId('player-overlay'), timeline: byId('timeline'),
@@ -404,6 +404,7 @@ function setMode(mode) {
   storage.set('moments.mode', mode);
   for (const button of els.modeButtons) button.setAttribute('aria-checked', String(button.dataset.mode === mode));
   els.optRefine.disabled = mode !== 'verified';
+  els.optVision.disabled = mode !== 'detect';
   if (mode === 'quick' && Number(els.optCandidates.value) === 20) setCandidates(12);
   if (mode === 'verified' && Number(els.optCandidates.value) === 12) setCandidates(20);
 }
@@ -419,7 +420,7 @@ function renderResults() {
   const job = s?.job;
   const key = [v.id, Boolean(v.index), v.jobs.length, s?.id, s?.status, s?.error,
     job && ACTIVE.includes(s.status) ? [job.status, job.stage, job.stages, job.tasks, job.model, job.cancel_requested] : null,
-    s?.feedback, s?.refinements];
+    s?.feedback, s?.refinements, s?.missed];
   // A feedback mark redraws the same results, so keep the list where the user was reading.
   const sameSearch = rendered.results && JSON.stringify(JSON.parse(rendered.results).slice(0, 6)) === JSON.stringify(key.slice(0, 6));
   if (!changed('results', key)) return;
@@ -528,6 +529,10 @@ function resultsContent(s) {
 }
 
 function feedbackBar(s) {
+  if (s.result?.routed) {
+    return h('div', { class: 'feedback-bar' }, h('p', { class: 'feedback-learning' }, icon('shield', 13),
+      `${s.result.routed.reason} It was answered by Verified text reading instead, so results cannot be marked.`));
+  }
   const marks = Object.values(s.feedback || {});
   const right = marks.filter((label) => label === 'positive').length;
   const wrong = marks.filter((label) => label === 'negative').length;
@@ -539,6 +544,7 @@ function feedbackBar(s) {
     s.error ? h('p', { class: 'feedback-error' }, `Refining failed: ${s.error}`) : null,
     s.refinements ? h('p', { class: 'feedback-plan' }, `Refined ${plural(s.refinements, 'time')} with your marks.`) : null,
     s.learning ? h('p', { class: 'feedback-learning' }, icon('sparkle', 13), learningSummary(s.learning, s.result?.diagnostics?.learning)) : null,
+    missedControls(s),
     h('div', { class: 'feedback-row' },
       h('span', { class: 'feedback-count' }, marks.length
         ? `${plural(right, 'result')} marked right · ${wrong} wrong`
@@ -547,6 +553,59 @@ function feedbackBar(s) {
         type: 'button', class: 'button button-primary button-small', disabled: !marks.length,
         onclick: () => refineSearch(s),
       }, icon('refresh', 14), 'Refine with feedback')));
+}
+
+// A moment the search should have found: mark its start and end while playing the video.
+function missedControls(s) {
+  const pending = state.missedStart != null && state.missedStart.search === s.id ? state.missedStart.time : null;
+  const missed = Object.entries(s.missed || {}).sort(([, a], [, b]) => a.start - b.start);
+  return h('div', { class: 'missed' },
+    missed.length ? h('div', { class: 'missed-list' }, missed.map(([key, moment]) => h('span', {
+      class: 'chip chip-small', title: moment.detected ? 'Learned from' : 'Nothing was detected here, so there is nothing to learn from',
+    }, `Missed ${preciseTime(moment.start)}–${preciseTime(moment.end)}${moment.detected ? '' : ' · not detected'}`,
+      h('button', { type: 'button', class: 'chip-remove', 'aria-label': 'Remove this missed moment', onclick: () => removeMissed(s, key) }, icon('x', 11))))) : null,
+    h('div', { class: 'feedback-row' },
+      h('span', { class: 'feedback-count' }, pending == null
+        ? 'Something missing? Play to where it starts and mark it.'
+        : `Started at ${preciseTime(pending)}. Play to where it ends.`),
+      h('span', { class: 'missed-actions' },
+        pending == null
+          ? h('button', { type: 'button', class: 'button button-ghost button-small', onclick: () => markMissedStart(s) }, icon('plus', 14), 'Mark missed start')
+          : [h('button', { type: 'button', class: 'button button-ghost button-small', onclick: () => markMissedEnd(s) }, icon('check', 14), 'Mark end'),
+             h('button', { type: 'button', class: 'button button-ghost button-small', onclick: () => { state.missedStart = null; rendered.results = null; renderResults(); } }, 'Cancel')])));
+}
+
+function markMissedStart(s) {
+  state.missedStart = { search: s.id, time: els.video.currentTime };
+  rendered.results = null;
+  renderResults();
+}
+
+async function markMissedEnd(s) {
+  const start = state.missedStart.time;
+  const end = els.video.currentTime;
+  if (end - start < 0.3) {
+    toast('Play forward to where the missed moment ends, then mark the end.', 'error');
+    return;
+  }
+  try {
+    const updated = await api.addMissed(state.video.id, s.id, { start, end });
+    state.missedStart = null;
+    state.search = { ...state.search, feedback: updated.feedback, missed: updated.missed, learning: updated.learning };
+    renderResults();
+  } catch (error) {
+    toast(error.message, 'error');
+  }
+}
+
+async function removeMissed(s, key) {
+  try {
+    const updated = await api.searchFeedback(state.video.id, s.id, { match_key: key, label: null });
+    state.search = { ...state.search, feedback: updated.feedback, missed: updated.missed, learning: updated.learning };
+    renderResults();
+  } catch (error) {
+    toast(error.message, 'error');
+  }
 }
 
 // One line on what the marks have taught Detect so far, and whether this search used it.
@@ -572,7 +631,7 @@ async function markResult(s, match, label) {
   const current = (s.feedback || {})[match.match_key];
   try {
     const updated = await api.searchFeedback(state.video.id, s.id, { match_key: match.match_key, label: current === label ? null : label });
-    state.search = { ...state.search, feedback: updated.feedback, learning: updated.learning };
+    state.search = { ...state.search, feedback: updated.feedback, missed: updated.missed, learning: updated.learning };
     renderResults();
   } catch (error) {
     toast(error.message, 'error');
@@ -602,6 +661,8 @@ function matchCard(match, index, s) {
     ['Verifier', match.pro_reason],
     ['Where', match.target_description],
     ['Model', match.verification_model],
+    ['Vision check', match.vision ? `${match.vision.matches ? 'Yes' : 'No'} · ${match.vision.reason}` : null],
+    ['Added by', match.decided_by === 'you' ? 'You, as a missed moment' : null],
     ['Full note', description.length > 150 ? description : null],
   ].filter(([, value]) => value);
   const hasDetails = facts.length || frames.length || match.region_crop_url || match.clip_url;
@@ -687,6 +748,48 @@ function stat(value, label) {
   return h('div', { class: 'stat' }, h('div', { class: 'stat-label' }, label), h('div', { class: 'stat-value', title: String(value) }, value));
 }
 
+// The planner's reading of the request, editable: fix what it got wrong and search again.
+function planEditor(search, plan) {
+  const field = (name, label, value, hint, type = 'text') => h('label', { class: 'plan-field' },
+    h('span', {}, label),
+    h('input', { name, type, value: value ?? '', ...(type === 'number' ? { min: name === 'with_count' ? 0 : 1, max: 20 } : { maxlength: 200 }) }),
+    hint ? h('small', {}, hint) : null);
+  const form = h('form', { class: 'plan-editor' },
+    field('object', 'Detect', plan.object, 'A plain category a detector can find: person, dog, car, egg.'),
+    field('target', 'Looks like', plan.target, 'What sets it apart, as a description of one of them. Empty if any counts.'),
+    field('contrasts', 'Rather than', (plan.contrasts || []).join('; '), 'Similar things that do not count, separated by semicolons.'),
+    field('min_count', 'At least this many at once', plan.min_count || 1, null, 'number'),
+    field('with_object', 'Carrying or holding', plan.with_object, 'Another detectable thing on or held by it, e.g. person for riders.'),
+    field('with_count', 'How many of those', plan.with_count || 0, null, 'number'),
+    field('action', 'Motion', plan.action, 'What happens, as a description of a moving clip. Empty for appearance only.'),
+    field('action_contrasts', 'Rather than', (plan.action_contrasts || []).join('; '), 'Different motions in a similar setting, separated by semicolons.'),
+    h('button', { type: 'submit', class: 'button button-primary button-small' }, icon('search', 14), 'Search again with this plan'));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(form));
+    const edited = {
+      ...data,
+      contrasts: data.contrasts.split(';').map((x) => x.trim()).filter(Boolean),
+      action_contrasts: data.action_contrasts.split(';').map((x) => x.trim()).filter(Boolean),
+      min_count: Number(data.min_count) || 1,
+      with_count: Number(data.with_count) || 0,
+    };
+    try {
+      const next = await api.createSearch(state.video.id, { query: search.query, mode: 'detect', options: { ...search.options, plan: edited } });
+      state.search = next;
+      state.searchId = next.id;
+      state.activeMatch = -1;
+      state.video.searches = [{ id: next.id, query: next.query, mode: next.mode, status: next.status, created_at: next.created_at }, ...(state.video.searches || [])];
+      updateHash();
+      render();
+      schedulePoll(600);
+    } catch (error) {
+      toast(error.message, 'error');
+    }
+  });
+  return h('details', { class: 'plan-edit' }, h('summary', {}, 'Edit this plan'), form);
+}
+
 function detectPlan(search, result, plan, d) {
   const blocks = [h('div', { class: 'plan-summary' },
     stat('Detect and track', 'Route'),
@@ -703,7 +806,9 @@ function detectPlan(search, result, plan, d) {
     ['Motion', plan.action],
     ['Rather than', plan.action_contrasts?.join('; ')],
   ].filter(([, value]) => value);
-  blocks.push(section('What it looked for', h('dl', { class: 'facts facts-wide' }, rows.flatMap(([label, value]) => [h('dt', {}, label), h('dd', {}, value)]))));
+  blocks.push(section(plan.edited ? 'What it looked for (your edited plan)' : 'What it looked for',
+    h('dl', { class: 'facts facts-wide' }, rows.flatMap(([label, value]) => [h('dt', {}, label), h('dd', {}, value)]))));
+  if (!result.routed) blocks.push(planEditor(search, plan));
   const steps = [
     [d.num_shots, 'Shots'],
     [d.frames_examined, 'Frames detected'],
@@ -900,6 +1005,7 @@ async function runSearch(query, mode = state.mode) {
       mode,
       options: {
         refine_boundaries: els.optRefine.checked,
+        ...(mode === 'detect' ? { vision_check: els.optVision.checked } : {}),
         min_confidence: Number(els.optConfidence.value),
         max_candidates: Number(els.optCandidates.value),
       },

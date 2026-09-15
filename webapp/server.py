@@ -150,6 +150,12 @@ def create_app(service=None, allowed_hosts=None):
         return JSONResponse(await run_in_threadpool(
             service.set_feedback, params["video_id"], params["search_id"], data.get("match_key"), data.get("label")))
 
+    async def missed(request):
+        params = request.path_params
+        data = await body_json(request)
+        return JSONResponse(await run_in_threadpool(
+            service.add_missed, params["video_id"], params["search_id"], data.get("start"), data.get("end")))
+
     async def refine(request):
         params = request.path_params
         service.start_refine(params["video_id"], params["search_id"])
@@ -189,6 +195,7 @@ def create_app(service=None, allowed_hosts=None):
         Route("/api/videos/{video_id}/searches/{search_id}", search, methods=["GET", "DELETE"]),
         Route("/api/videos/{video_id}/searches/{search_id}/feedback", feedback, methods=["POST"]),
         Route("/api/videos/{video_id}/searches/{search_id}/refine", refine, methods=["POST"]),
+        Route("/api/videos/{video_id}/searches/{search_id}/missed", missed, methods=["POST"]),
         Route("/api/videos/{video_id}/searches/{search_id}/files/{path:path}", search_file),
         Route("/api/learning", learning),
         Route("/api/jobs", jobs),

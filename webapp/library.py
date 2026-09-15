@@ -49,7 +49,16 @@ def write_json(path, data):
     path = Path(path)
     partial = path.with_name(path.name + ".partial")
     partial.write_text(json.dumps(data, default=_json_default), encoding="utf-8")
-    os.replace(partial, path)
+    # On Windows a replace fails while another thread is reading the file (the browser polls searches
+    # every second), so wait out the read rather than failing the request.
+    for attempt in range(20):
+        try:
+            os.replace(partial, path)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
 
 
 def _json_default(value):

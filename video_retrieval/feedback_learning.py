@@ -45,10 +45,12 @@ FEATURES = [
     "has_target",
     "has_action",
     "shot_priority",       # how well the shot matched the query before detection
+    "vision_checked",      # 1 when the vision model was asked about it
+    "vision_yes",          # 1 when the vision model said it shows the request
 ]
 LOG_FEATURES = {"samples", "duration", "box_area", "count", "identities", "track_length"}
 
-MIN_EXAMPLES = 40          # below this a model over 18 measurements is guessing
+MIN_EXAMPLES = 40          # below this a model over 20 measurements is guessing
 MIN_PER_CLASS = 10         # it needs to have seen both right and wrong results
 MIN_VIDEOS = 2             # evaluation holds out whole videos
 MARGIN = 0.02              # how much better than the rules it must be on held-out videos
@@ -144,6 +146,10 @@ class Learner:
         self.examples = self._load_examples()
         self.model = self._load_json("model.json")
         self.history = self._load_json("history.json") or []
+        if self.model and self.model.get("features") and self.model["features"] != FEATURES:
+            # Saved by a version that measured different things; relearn from the same marks.
+            self._retrain()
+            self._save()
 
     # ------------------------------------------------------------ storage
 

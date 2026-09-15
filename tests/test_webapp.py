@@ -192,6 +192,49 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual((after_failure["status"], after_failure["error"]), ("done", "out of memory"))
         self.assertEqual(after_failure["result"]["num_matches"], 1)
 
+    def test_detect_plans_missed_moments_and_text_routing(self):
+        video = self.indexed_video()
+        base = f"/api/videos/{video['id']}/searches"
+        bad = {"query": "officers", "mode": "detect", "options": {"plan": {"object": "", "action": ""}}}
+        self.assertEqual(self.client.post(base, json=bad, headers=HEADERS).status_code, 400)
+        edited = {"object": " person ", "target": "a police officer", "contrasts": "a person; a chef", "min_count": "2"}
+        search = self.client.post(base, json={"query": "officers", "mode": "detect",
+                                              "options": {"plan": edited, "vision_check": False}}, headers=HEADERS).json()
+        self.assertEqual(search["options"]["plan"]["contrasts"], ["a person", "a chef"])
+        self.assertEqual(search["options"]["plan"]["min_count"], 2)
+        self.assertNotIn("Checking results with the vision model", search["job"]["stages"])
+        url = f"{base}/{search['id']}"
+
+        def fake_detect(query, resources, output_root, **kwargs):
+            self.assertEqual(kwargs["plan"]["object"], "person")
+            self.assertFalse(kwargs["vision_check"])
+            return self.detect_result(output_root, ["0:1.00"])
+
+        with patch("webapp.service.check_runtime"), patch("video_retrieval.detect_search.detect_search", side_effect=fake_detect):
+            self.assertEqual(self.jobs.run_next(timeout=1).status, "done")
+
+        self.assertEqual(self.client.post(f"{url}/missed", json={"start": 5, "end": 5.1}, headers=HEADERS).status_code, 400)
+        candidate = {"match_key": "missed:2.00", "detected": True}
+        example = {"features": {"rule_pass": 0}, "embedding": None, "concept": "person", "query": "officers"}
+        with patch("webapp.service.missed_candidate", return_value=(candidate, example)) as missed:
+            added = self.client.post(f"{url}/missed", json={"start": 2, "end": 2.8}, headers=HEADERS).json()
+        self.assertEqual(missed.call_args.args[1:], (2.0, 2.8))
+        self.assertEqual(added["feedback"], {"missed:2.00": "positive"})
+        self.assertEqual(added["missed"]["missed:2.00"], {"start": 2.0, "end": 2.8, "detected": True})
+        self.assertEqual(added["learning"]["examples"], 1)
+        removed = self.client.post(f"{url}/feedback", json={"match_key": "missed:2.00", "label": None}, headers=HEADERS).json()
+        self.assertEqual((removed["feedback"], removed["missed"], removed["learning"]["examples"]), ({}, {}, 0))
+
+        reading = self.client.post(base, json={"query": "read the sign", "mode": "detect"}, headers=HEADERS).json()
+        self.pipeline.retrieve.return_value = {"query": "read the sign", "matches": [], "plan": {"executor": "visual_text_extraction"}}
+        with patch("webapp.service.check_runtime"), \
+                patch("video_retrieval.detect_search.detect_search", return_value={"route": "text", "plan": {}}):
+            self.assertEqual(self.jobs.run_next(timeout=1).status, "done")
+        routed = self.client.get(f"{base}/{reading['id']}").json()
+        self.assertEqual(routed["result"]["routed"]["to"], "verified")
+        self.assertTrue(self.pipeline.retrieve.call_args.kwargs["run_verification"])
+        self.assertEqual(self.client.post(f"{base}/{reading['id']}/missed", json={"start": 1, "end": 2}, headers=HEADERS).status_code, 400)
+
     def test_only_detect_searches_take_feedback(self):
         video = self.indexed_video()
         base = f"/api/videos/{video['id']}/searches"
@@ -237,6 +280,22 @@ class WebAppTest(unittest.TestCase):
         self.service.library.update(video["id"], status="indexing")
         Service(self.service.library, JobQueue(start=False), settings_path=self.root / "settings.json")
         self.assertEqual(self.service.library.get(video["id"])["status"], "interrupted")
+
+    def test_json_writes_wait_out_a_reader_holding_the_file(self):
+        from webapp import library
+
+        path = self.root / "record.json"
+        real_replace, calls = library.os.replace, []
+
+        def busy_then_free(source, target):
+            calls.append(target)
+            if len(calls) < 3:
+                raise PermissionError("Access is denied")
+            real_replace(source, target)
+
+        with patch.object(library.os, "replace", side_effect=busy_then_free), patch.object(library.time, "sleep"):
+            library.write_json(path, {"a": 1})
+        self.assertEqual((len(calls), json.loads(path.read_text())), (3, {"a": 1}))
 
     def test_evidence_downsampling_keeps_peaks(self):
         rows = [{"start": i, "end": i + 1, "score": 1.0 if i == 1234 else 0.0, "channel_scores": {"video": float(i == 99)}} for i in range(5000)]

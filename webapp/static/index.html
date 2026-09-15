@@ -81,6 +81,10 @@
                 <small>Tightens start and end times with extra vision checks. Verified mode only.</small>
               </label>
               <label class="option-row">
+                <span class="option-head"><strong>Double-check results</strong><input type="checkbox" class="switch" id="opt-vision" checked></span>
+                <small>Asks the vision model whether each result really shows the request. Detect mode only.</small>
+              </label>
+              <label class="option-row">
                 <span class="option-head"><strong>Minimum confidence</strong><output id="opt-confidence-out">25%</output></span>
                 <input type="range" id="opt-confidence" min="0" max="0.9" step="0.05" value="0.25">
                 <small>Verified matches below this are dropped.</small>

@@ -195,6 +195,23 @@ class AssembleTest(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertAlmostEqual(results[0]["confidence"], 0.6)   # (0.5 + 0.5 * 0.2) * min(1, 4 / 4)
 
+    def test_each_stretch_of_motion_in_a_long_track_is_its_own_result(self):
+        times = [t / 2 for t in range(0, 20)]                   # one person in view for the whole 10 s take
+        track = steady_track(times, 0.5, unit(0))
+        track["observations"][2]["probability"] = 0.9           # the best crop is at 1.0 s
+        track["observations"][16]["probability"] = 0.7          # and the best inside the second stretch at 8.0 s
+        windows = [
+            {"shot": 0, "start": 0.0, "end": 2.0, "probability": 0.5, "choices": 8, "embedding": unit(0)},
+            {"shot": 0, "start": 7.0, "end": 9.0, "probability": 0.5, "choices": 8, "embedding": unit(0)},
+            {"shot": 0, "start": 4.0, "end": 6.0, "probability": 0.05, "choices": 8, "embedding": unit(0)},  # no motion
+        ]
+        state = make_state([track], plan={"object": "person", "target": "", "contrasts": [], "action": "waving"},
+                           windows=windows)
+        results = detect.assemble(state)
+        self.assertEqual([(r["start"], r["end"]) for r in results], [(0.0, 2.0), (7.0, 9.0)])
+        self.assertEqual([r["evidence"][1]["time"] for r in results], [1.0, 8.0])   # evidence from inside each result
+        self.assertEqual([r["features"]["samples"] for r in results], [5, 5])
+
     def test_results_either_side_of_a_bridged_boundary_join(self):
         shots_ = [{"id": 0, "start": 0.0, "end": 2.0}, {"id": 1, "start": 2.0, "end": 4.0}]
         tracks = [steady_track([1.0, 1.5], 0.8, unit(0), shot=0), steady_track([2.5, 3.0], 0.8, unit(0), shot=1)]

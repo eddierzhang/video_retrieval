@@ -24,6 +24,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 import pickle
+import re
 
 import numpy as np
 
@@ -37,8 +38,19 @@ DETECT_STAGES = [
     "Detecting objects",
     "Scoring motion",
     "Assembling results",
+    "Checking results with the vision model",
     "Extracting matching clips",
 ]
+
+VISION_SCHEMA = {
+    "type": "object",
+    "properties": {"matches": {"type": "boolean"}, "reason": {"type": "string"}},
+    "required": ["matches", "reason"],
+    "additionalProperties": False,
+}
+
+# The vision model is asked about at most this many results per search, most confident first.
+MAX_VISION_CHECKS = 12
 
 GENERIC_ACTION_CONTRASTS = [
     "people standing still",
@@ -58,8 +70,10 @@ PLAN_SCHEMA = {
         "with_count": {"type": "integer"},
         "action": {"type": "string"},
         "action_contrasts": {"type": "array", "items": {"type": "string"}},
+        "reads_text": {"type": "boolean"},
     },
-    "required": ["object", "target", "contrasts", "min_count", "with_object", "with_count", "action", "action_contrasts"],
+    "required": ["object", "target", "contrasts", "min_count", "with_object", "with_count", "action", "action_contrasts",
+                 "reads_text"],
     "additionalProperties": False,
 }
 
@@ -97,16 +111,23 @@ Fill in:
   a single frame mid-swat rarely shows it. Only set target alongside an action when the request
   names a separate appearance ("a girl in a red dress running" -> target "a girl in a red dress").
 - action_contrasts: 2-4 clearly different motions in a similar setting. Empty if action is empty.
+- reads_text: true when the request asks to read, transcribe or identify written text or numbers (a
+  sign, a title, a plate, a jersey number); false when text is only part of a description.
 """
     try:
         plan = local_backend.chat_json(prompt, PLAN_SCHEMA, role="planner")
     except Exception as exc:  # the detector can still run on the user's own words
         plan = {"object": query, "target": "", "contrasts": [], "min_count": 1, "with_object": "", "with_count": 0, "action": "",
+                "reads_text": bool(TEXT_REQUEST.search(query)),
                 "action_contrasts": [], "planning_error": str(exc)}
     return normalize_plan(plan, query)
 
 
 NOUN_STARTS = ("a ", "an ", "the ", "one ", "two ", "three ", "some ", "several ")
+
+# Used only when the planner is unavailable: requests that plainly ask for text to be read.
+TEXT_REQUEST = re.compile(r"^\s*(read|transcribe)\b|what (does|do) .+ say|what is written|\b(number|title|name) (on|of)\b",
+                          re.IGNORECASE)
 
 
 def with_subject(description, category):
@@ -130,7 +151,9 @@ def normalize_plan(plan, query):
         "with_count": max(0, min(20, int(plan.get("with_count") or 0))),
         "action": " ".join(str(plan.get("action", "")).split()),
         "action_contrasts": clean(plan.get("action_contrasts"))[:4],
+        "reads_text": bool(plan.get("reads_text")),
         **({"planning_error": plan["planning_error"]} if plan.get("planning_error") else {}),
+        **({"edited": True} if plan.get("edited") else {}),
     }
     if plan["target"] and plan["object"]:
         # "carrying two riders" scores poorly on its own; it describes a motorcycle, so say so.
@@ -429,6 +452,65 @@ def assemble(state, attribute_threshold=0.5, action_threshold=2.0, feedback=None
     gate_on_appearance = bool(plan["target"]) and not plan["action"]
     present = lambda o: o.get("related") is not False and (o["final"] >= attribute_threshold or not gate_on_appearance)
 
+    def object_candidate(shot, start, end, hits, step, action_windows=None):
+        """One result from the detections inside [start, end]; None when none fall inside."""
+        inside = [(t, o) for t, o in hits if start - step / 2 <= o["time"] <= end + step / 2]
+        if not inside:
+            return None
+        appearance = float(max(np.mean([o["final"] for o in t["observations"]]) for t, _ in inside))
+        # When appearance does not decide, it only nudges: a poorly worded pose must not make a
+        # clip the motion scoring found look like a 4% guess.
+        confidence = appearance if gate_on_appearance or not plan["target"] else 0.5 + 0.5 * appearance
+        per_time = {}
+        for _, o in inside:
+            per_time[o["time"]] = per_time.get(o["time"], 0) + 1
+        identities = sorted({t["identity"] for t, _ in inside})
+        count = max(per_time.values())
+        features = {
+            "appearance": appearance, "peak_probability": max(o["final"] for _, o in inside),
+            "detector_score": float(np.mean([o["score"] for _, o in inside])),
+            "samples": len(per_time), "duration": end - start,
+            "shot_share": (end - start) / max(1e-6, shot["end"] - shot["start"]),
+            **box_features([o for _, o in inside]), "count": count, "identities": len(identities),
+            "track_length": max(len(t["observations"]) for t, _ in inside),
+            "has_object": 1, "has_target": int(bool(plan["target"])), "has_action": int(bool(plan["action"])),
+            "shot_priority": priority.get(shot["id"], 0.0),
+        }
+        if action_windows:
+            confidence *= strength(action_windows)
+            features["action_lift"] = max(lift(w) for w in action_windows)
+        return {
+            "shot": shot["id"], "start": start, "end": end, "confidence": confidence,
+            "identities": identities, "count": count,
+            "evidence": max(inside, key=lambda hit: hit[1]["final"]),
+            "exemplars": [o["embedding"] for _, o in inside][:12],
+            "features": features,
+        }
+
+    def window_runs(windows):
+        """Overlapping motion windows merged into contiguous runs."""
+        merged = []
+        for window in sorted(windows, key=lambda w: w["start"]):
+            if merged and window["start"] <= merged[-1]["end"]:
+                merged[-1]["end"] = max(merged[-1]["end"], window["end"])
+                merged[-1]["windows"].append(window)
+            else:
+                merged.append({"start": window["start"], "end": window["end"], "windows": [window]})
+        return merged
+
+    # A clip's action score is a share of probability among every description offered, so what it
+    # means depends on how many there were. Compare with chance: with eight descriptions, 0.35 is
+    # nearly three times what a random pick would get.
+    lift = lambda w: w["final"] * w.get("choices", 1)
+    # Strength is measured against the search's own threshold, so looser passes (near misses, missed
+    # moments at zero) give confidences on the same scale.
+    reference = max(state.get("thresholds", {}).get("action", action_threshold), 1e-6)
+    strength = lambda windows: min(1.0, max(lift(w) for w in windows) / (2.0 * reference))
+    good = [w for w in state["windows"] if lift(w) >= action_threshold] if plan["action"] else []
+    if plan["action"] and not plan["object"] and good:
+        best = max(lift(w) for w in good)
+        good = [w for w in good if lift(w) >= 0.5 * best]  # with nothing to detect, keep the clear standouts
+
     candidates = []
     if plan["object"]:
         for shot_id, shot in shots_by_id.items():
@@ -453,76 +535,34 @@ def assemble(state, attribute_threshold=0.5, action_threshold=2.0, feedback=None
                 start = max(shot["start"], run[0] - step / 2)
                 end = min(shot["end"], run[-1] + step / 2)
                 hits = [hit for time in run for hit in per_time[time]]
-                appearance = float(max(np.mean([o["final"] for o in t["observations"]]) for t, _ in hits))
-                # When appearance does not decide, it only nudges: a poorly worded pose must not make a
-                # clip the motion scoring found look like a 4% guess.
-                confidence = appearance if gate_on_appearance or not plan["target"] else 0.5 + 0.5 * appearance
-                identities = sorted({t["identity"] for t, _ in hits})
-                count = max(len(per_time[time]) for time in run)
+                if not plan["action"]:
+                    candidates.append(object_candidate(shot, start, end, hits, step))
+                    continue
+                # With a motion, each stretch where it happens is its own result, built only from the
+                # detections inside it - in a long handheld take one track can span several events.
+                overlapping = [w for w in good if w["shot"] == shot_id and w["start"] < end and w["end"] > start]
+                for motion in window_runs(overlapping):
+                    candidate = object_candidate(shot, max(start, motion["start"]), min(end, motion["end"]),
+                                                 hits, step, motion["windows"])
+                    if candidate:
+                        candidates.append(candidate)
+    elif plan["action"]:
+        for shot_id, shot in shots_by_id.items():
+            for run in window_runs([w for w in good if w["shot"] == shot_id]):
                 candidates.append({
-                    "shot": shot_id, "start": start, "end": end, "confidence": confidence,
-                    "identities": identities, "count": count,
-                    "evidence": max(hits, key=lambda hit: hit[1]["final"]),
-                    "exemplars": [o["embedding"] for _, o in hits][:12],
+                    "shot": shot_id, "start": run["start"], "end": run["end"],
+                    "confidence": float(strength(run["windows"])),
+                    "identities": [], "count": 0, "evidence": None,
+                    "exemplars": [w["embedding"] for w in run["windows"]][:12],
                     "features": {
-                        "appearance": appearance, "peak_probability": max(o["final"] for _, o in hits),
-                        "detector_score": float(np.mean([o["score"] for _, o in hits])),
-                        "samples": len(run), "duration": end - start,
-                        "shot_share": (end - start) / max(1e-6, shot["end"] - shot["start"]),
-                        **box_features([o for _, o in hits]), "count": count, "identities": len(identities),
-                        "track_length": max(len(t["observations"]) for t, _ in hits),
-                        "has_object": 1, "has_target": int(bool(plan["target"])), "has_action": int(bool(plan["action"])),
+                        "appearance": 0.0, "peak_probability": max(w["final"] for w in run["windows"]),
+                        "samples": len(run["windows"]), "duration": run["end"] - run["start"],
+                        "shot_share": (run["end"] - run["start"]) / max(1e-6, shot["end"] - shot["start"]),
+                        "action_lift": max(lift(w) for w in run["windows"]),
+                        "has_object": 0, "has_target": 0, "has_action": 1,
                         "shot_priority": priority.get(shot_id, 0.0),
                     },
                 })
-    if plan["action"]:
-        # A clip's action score is a share of probability among every description offered, so what it
-        # means depends on how many there were. Compare with chance: with eight descriptions, 0.35 is
-        # nearly three times what a random pick would get.
-        lift = lambda w: w["final"] * w.get("choices", 1)
-        good = [w for w in state["windows"] if lift(w) >= action_threshold]
-        if not plan["object"] and good:
-            best = max(lift(w) for w in good)
-            good = [w for w in good if lift(w) >= 0.5 * best]  # with nothing to detect, keep the clear standouts
-        strength = lambda windows: min(1.0, max(lift(w) for w in windows) / (2.0 * action_threshold))
-        if plan["object"]:
-            kept = []
-            for candidate in candidates:
-                overlapping = [w for w in good if w["start"] < candidate["end"] and w["end"] > candidate["start"]]
-                if overlapping:
-                    candidate["start"] = max(candidate["start"], min(w["start"] for w in overlapping))
-                    candidate["end"] = min(candidate["end"], max(w["end"] for w in overlapping))
-                    candidate["confidence"] *= strength(overlapping)
-                    candidate["features"]["action_lift"] = max(lift(w) for w in overlapping)
-                    candidate["features"]["duration"] = candidate["end"] - candidate["start"]
-                    kept.append(candidate)
-            candidates = kept
-        else:
-            for shot_id in shots_by_id:
-                windows = sorted((w for w in good if w["shot"] == shot_id), key=lambda w: w["start"])
-                merged = []
-                for window in windows:
-                    if merged and window["start"] <= merged[-1]["end"]:
-                        merged[-1]["end"] = max(merged[-1]["end"], window["end"])
-                        merged[-1]["windows"].append(window)
-                    else:
-                        merged.append({"start": window["start"], "end": window["end"], "windows": [window]})
-                shot = shots_by_id[shot_id]
-                for run in merged:
-                    confidence = float(strength(run["windows"]))
-                    candidates.append({
-                        "shot": shot_id, "start": run["start"], "end": run["end"], "confidence": confidence,
-                        "identities": [], "count": 0, "evidence": None,
-                        "exemplars": [w["embedding"] for w in run["windows"]][:12],
-                        "features": {
-                            "appearance": 0.0, "peak_probability": max(w["final"] for w in run["windows"]),
-                            "samples": len(run["windows"]), "duration": run["end"] - run["start"],
-                            "shot_share": (run["end"] - run["start"]) / max(1e-6, shot["end"] - shot["start"]),
-                            "action_lift": max(lift(w) for w in run["windows"]),
-                            "has_object": 0, "has_target": 0, "has_action": 1,
-                            "shot_priority": priority.get(shot_id, 0.0),
-                        },
-                    })
 
     # Join results either side of a boundary that a track was seen to continue across.
     candidates.sort(key=lambda c: c["start"])
@@ -554,11 +594,12 @@ NEAR_MISS_ATTRIBUTE = 0.6
 NEAR_MISS_ACTION = 0.65
 
 
-def propose(state, feedback=None, memory=None, scorer=None):
+def propose(state, feedback=None, memory=None, scorer=None, checker=None):
     """The results to show: the rules' results, or once a learned scorer beats the rules, its choice.
 
     With a scorer, results that just missed the thresholds are considered too, so what the scorer has
-    learned can recover them as well as reject the rules' false positives.
+    learned can recover them as well as reject the rules' false positives. `checker` asks the vision
+    model about the results; without a scorer its "no" removes a result, with one it is a measurement.
     """
     thresholds = state["thresholds"]
     strict = assemble(state, thresholds["attribute"], thresholds["action"], feedback=feedback, memory=memory)
@@ -567,13 +608,18 @@ def propose(state, feedback=None, memory=None, scorer=None):
         candidate["rule_pass"] = True
         candidate["decided_by"] = "rules"
     if scorer is None:
-        return strict
+        if checker is None:
+            return strict
+        checker(strict)
+        return [c for c in strict if (c.get("vision") or {}).get("matches") is not False]
     relaxed = assemble(state, thresholds["attribute"] * NEAR_MISS_ATTRIBUTE, thresholds["action"] * NEAR_MISS_ACTION,
                        feedback=feedback, memory=memory)
     near =[c for c in relaxed if not any(mostly_inside(c, s) or mostly_inside(s, c) for s in strict)]
     for candidate in near:
         candidate["features"]["rule_pass"] = 0
         candidate["rule_pass"] = False
+    if checker is not None:
+        checker(strict + near)
     kept = []
     for candidate in strict + near:
         probability = scorer.probability(candidate["features"])
@@ -589,7 +635,7 @@ def propose(state, feedback=None, memory=None, scorer=None):
 
 def detect_search(query, resources, output_root, max_frames=400, detect_fps=2.0, box_threshold=0.3,
                   attribute_threshold=0.5, action_threshold=2.0, final_frame_fps=1.0, max_frames_per_match=8,
-                  plan=None, learner=None, search_id=None):
+                  plan=None, learner=None, search_id=None, vision_check=True):
     """Answer `query` for one video by detection, tracking and clip scoring; saves state for feedback.
 
     `learner` (a feedback_learning.Learner) supplies marks remembered from earlier searches and, once it
@@ -603,7 +649,10 @@ def detect_search(query, resources, output_root, max_frames=400, detect_fps=2.0,
     output_root.mkdir(parents=True, exist_ok=True)
 
     local_backend.stage("Planning detection")
-    plan = normalize_plan(plan, query) if plan else plan_detection(query)
+    plan = normalize_plan({**plan, "edited": True, "reads_text": False}, query) if plan else plan_detection(query)
+    if plan["reads_text"]:
+        # Detection cannot read; the caller answers with text reading instead.
+        return {"query": query, "route": "text", "plan": plan}
 
     local_backend.stage("Indexing shots")
     index = shot_index(video_path)
@@ -708,8 +757,9 @@ def detect_search(query, resources, output_root, max_frames=400, detect_fps=2.0,
         "shot_fps": shot_fps, "bridged": bridged, "thresholds": {"attribute": attribute_threshold, "action": action_threshold},
         "video_duration": float(manifest["video"]["duration"]),
         "shot_priority": {shot["id"]: float(p) for shot, p in ranked},
+        "vision_check": bool(vision_check),
     }
-    candidates, learning = learned_candidates(state, None, learner, search_id)
+    candidates, learning = learned_candidates(state, None, learner, search_id, video_path)
     state["last_matches"] = candidates
     diagnostics = {
         "num_shots": len(shots), "num_examined_shots": len(examined), "frames_examined": frames_used,
@@ -722,12 +772,19 @@ def detect_search(query, resources, output_root, max_frames=400, detect_fps=2.0,
                   {**diagnostics, "learning": learning})
 
 
-def learned_candidates(state, feedback, learner, search_id):
+def learned_candidates(state, feedback, learner, search_id, video_path=None):
     """Propose results with whatever the learner knows, and say how they were decided."""
     memory = learner.memory(state["plan"], exclude_search=search_id) if learner else None
     scorer = learner.scorer() if learner else None
-    candidates = propose(state, feedback=feedback, memory=memory, scorer=scorer)
+    checker = None
+    if state.get("vision_check") and video_path:
+        checker = lambda pool: vision_check(state, pool, video_path)
+    candidates = propose(state, feedback=feedback, memory=memory, scorer=scorer, checker=checker)
+    checks = state.get("vision_cache", {})
     return candidates, {
+        "vision_check": bool(checker),
+        "vision_rejected": sum(1 for answer in checks.values() if answer and not answer["matches"]),
+        "vision_error": state.get("vision_error"),
         "decided_by": "learned" if scorer else "rules",
         "model_version": scorer.version if scorer else None,
         "near_misses_kept": sum(1 for c in candidates if not c.get("rule_pass", True)),
@@ -746,6 +803,7 @@ def finish(state, candidates, output_root, video_path, manifest, final_frame_fps
         "description": describe(state["plan"], c),
         "decided_by": c.get("decided_by", "rules"), "near_miss": not c.get("rule_pass", True),
         "rule_confidence": c.get("features", {}).get("rule_confidence", c["confidence"]),
+        "vision": c.get("vision"),
     } for c in candidates]
     matches, result_file = materialize_final_matches(manifest, instances, state["query"], output_root=str(output_root),
                                                      frame_fps=final_frame_fps, max_frames_per_match=max_frames_per_match)
@@ -777,7 +835,7 @@ def describe(plan, candidate):
     return subject + (f" · {'; '.join(details)}" if details else "")
 
 
-def draw_evidence(video_path, candidate, state, output_root):
+def evidence_image(video_path, candidate, state):
     """The most confident frame of a result, with every qualifying detection boxed and labelled."""
     from PIL import Image, ImageDraw
 
@@ -799,11 +857,132 @@ def draw_evidence(video_path, candidate, state, output_root):
         draw.rectangle([x0 * width, y0 * height, x1 * width, y1 * height], outline=(255, 200, 0), width=3)
         draw.text((x0 * width + 4, y0 * height + 4),
                   f"#{other['identity']} {nearest.get('final', nearest['probability']):.0%}", fill=(255, 200, 0))
+    return image
+
+
+def draw_evidence(video_path, candidate, state, output_root):
+    image = evidence_image(video_path, candidate, state)
+    if image is None:
+        return None
     folder = output_root / "evidence"
     folder.mkdir(exist_ok=True)
     path = folder / f"match_{candidate['match_key'].replace(':', '_')}.jpg"
     image.save(path, quality=88)
     return path
+
+
+def clip_frames(video_path, start, end, count=3):
+    """`count` frames spread across [start, end], as RGB arrays."""
+    frames = []
+    for position in range(count):
+        time = start + (position + 0.5) * (end - start) / count
+        decoded = local_backend.decode_frames(video_path, time, time + 0.05, fps=20, max_side=768)
+        if decoded:
+            frames.append(decoded[0][1])
+    return frames
+
+
+def vision_key(candidate):
+    return f"{candidate['shot']}:{candidate['start']:.2f}:{candidate['end']:.2f}"
+
+
+def vision_check(state, candidates, video_path, limit=MAX_VISION_CHECKS):
+    """Ask the vision model whether each result shows the request; answers are cached in the state.
+
+    The model sees the boxed evidence frame and frames spread across the clip. Its answer is stored
+    on the result as `vision` and as the measurements `vision_checked` and `vision_yes`.
+    """
+    cache = state.setdefault("vision_cache", {})
+    ranked = sorted(candidates, key=lambda c: -c["features"].get("rule_confidence", c["confidence"]))
+    pending = [c for c in ranked if vision_key(c) not in cache][:limit]
+    if pending and not state.get("vision_error"):
+        local_backend.stage("Checking results with the vision model")
+        for candidate in local_backend.track(pending, "Checking results"):
+            images = []
+            if candidate.get("evidence"):
+                boxed = evidence_image(video_path, candidate, state)
+                if boxed is not None:
+                    images.append(np.asarray(boxed))
+            images.extend(clip_frames(video_path, candidate["start"], candidate["end"]))
+            if not images:
+                continue
+            boxes = " The first image marks with yellow boxes what an object detector found." if candidate.get("evidence") else ""
+            prompt = (f'Someone searched a video for: "{state["query"]}".\n'
+                      f"These images come from one candidate clip, {candidate['end'] - candidate['start']:.1f} seconds long, "
+                      f"in time order.{boxes}\n"
+                      "Does this clip show what they searched for? Judge strictly and check every part of the request: "
+                      "the kind of thing, how it looks, how many there are, and what is happening. If a required part "
+                      "cannot be seen, it does not match. Give matches and a one-sentence reason.")
+            try:
+                # image_base64 expects OpenCV's channel order.
+                answer = local_backend.images_json([image[:, :, ::-1] for image in images], prompt, VISION_SCHEMA)
+            except RuntimeError as exc:
+                state["vision_error"] = str(exc)  # results stay as they were before the check
+                break
+            cache[vision_key(candidate)] = {"matches": bool(answer["matches"]), "reason": str(answer["reason"])[:300]}
+    for candidate in candidates:
+        answer = cache.get(vision_key(candidate))
+        candidate["features"]["vision_checked"] = int(answer is not None)
+        candidate["features"]["vision_yes"] = int(bool(answer and answer["matches"]))
+        if answer is not None:
+            candidate["vision"] = answer
+
+
+def overlap_seconds(a, b):
+    return max(0.0, min(a["end"], b["end"]) - max(a["start"], b["start"]))
+
+
+def missed_candidate(output_root, start, end):
+    """Turn a stretch the user says was missed into a result, and an example for the learner.
+
+    The saved detections are re-assembled with every threshold at zero; the result overlapping the
+    stretch most supplies its measurements and evidence. When nothing was ever detected there, the
+    result has no measurements - the detector never saw it, so there is nothing to learn from.
+    Returns (candidate, example or None); the candidate is saved into the search's state.
+    """
+    from .feedback_learning import concept_key
+
+    path = Path(output_root) / "detect_state.pkl"
+    with open(path, "rb") as file:
+        state = pickle.load(file)
+    span = {"start": float(start), "end": float(end)}
+    middle = (span["start"] + span["end"]) / 2
+    shot = next((s for s in state["shots"] if s["start"] <= middle < s["end"]), state["shots"][-1])
+    loose = assemble(state, 0.0, 0.0, min_run=1)
+    best = max(loose, key=lambda c: overlap_seconds(c, span), default=None)
+    if best is not None and overlap_seconds(best, span) <= 0:
+        best = None
+    returned = [c for c in state.get("last_matches", []) if not str(c["match_key"]).startswith("missed:")]
+    key = f"missed:{span['start']:.2f}"
+    evidence = None
+    if best is not None and best.get("evidence") and span["start"] <= best["evidence"][1]["time"] <= span["end"]:
+        evidence = best["evidence"]
+    candidate = {
+        "shot": shot["id"], "start": span["start"], "end": span["end"], "confidence": 1.0, "match_key": key,
+        "identities": best["identities"] if best else [], "count": best["count"] if best else 0,
+        "evidence": evidence, "exemplars": best["exemplars"] if best else [],
+        "rule_pass": any(mostly_inside({**span, "shot": shot["id"]}, c) for c in returned),
+        "decided_by": "you", "detected": best is not None,
+    }
+    example = None
+    if best is not None:
+        features = {**best["features"], "duration": span["end"] - span["start"], "rule_pass": int(candidate["rule_pass"])}
+        candidate["features"] = features
+        exemplars = np.asarray(best["exemplars"] or [], dtype=np.float32)
+        embedding = None
+        if len(exemplars):
+            mean = exemplars.mean(axis=0)
+            embedding = (mean / max(float(np.linalg.norm(mean)), 1e-8)).astype(np.float16)
+        example = {"features": features, "embedding": embedding, "concept": concept_key(state["plan"]),
+                   "query": state["query"], "start": span["start"], "end": span["end"], "missed": True}
+    else:
+        candidate["features"] = {"duration": span["end"] - span["start"], "rule_pass": 0}
+    state["last_matches"] = [c for c in state.get("last_matches", []) if c["match_key"] != key] + [candidate]
+    temporary = path.with_suffix(".tmp")
+    with open(temporary, "wb") as file:
+        pickle.dump(state, file)
+    temporary.replace(path)
+    return candidate, example
 
 
 def mostly_inside(candidate, other, share=0.5):
@@ -841,7 +1020,7 @@ def refine(output_root, feedback, resources, final_frame_fps=1.0, max_frames_per
     output_root = Path(output_root)
     with open(output_root / "detect_state.pkl", "rb") as file:
         state = pickle.load(file)
-    candidates, learning = learned_candidates(state, feedback, learner, search_id)
+    candidates, learning = learned_candidates(state, feedback, learner, search_id, resources.manifest["video"]["path"])
     # Marked results keep their verdict whatever the re-scoring says about their neighbours.
     previous = {c["match_key"]: c for c in state["last_matches"]}
     keys = {c["match_key"] for c in candidates}

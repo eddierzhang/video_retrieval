@@ -39,10 +39,18 @@ The first index also downloads the SigLIP 2 and Whisper weights (about 1.5 GB) i
    * **Verified** checks every candidate with the local vision model and tightens the clip
      boundaries. Slower, and false positives are rejected.
    * **Quick** ranks moments straight from the indexes in seconds, with no vision checks.
-4. **Read the answer** — each moment gives a clip, a confidence score, the evidence behind it,
+   * **Detect** finds *every* clip where something appears: it detects objects frame by frame,
+     tracks them, scores motion, and (optionally) asks the vision model to double-check each result.
+     Requests to read text are handed to Verified text reading automatically.
+4. **Teach Detect** — mark results ✓ Right or ✗ Wrong, or play to a moment it missed and mark its
+   start and end. *Refine with feedback* re-scores the search in seconds. Every mark is also saved
+   as a training example: once there are enough, a small learned scorer is trained and takes over
+   from the fixed thresholds, but only while it beats them on videos it was not trained on. The
+   *Query plan* tab shows what Detect looked for and lets you edit the plan and search again.
+5. **Read the answer** — each moment gives a clip, a confidence score, the evidence behind it,
    and a frame strip. The timeline shows where the query found support across the whole video,
    which regions were searched, and where the answers are.
-5. **Look under the hood** — the *Query plan* tab shows the route taken, the evidence the planner
+6. **Look under the hood** — the *Query plan* tab shows the route taken, the evidence the planner
    decomposed your question into, how the retrieval channels were weighted, and the funnel from
    candidates to confirmed matches. *Transcript* and *History* sit beside it.
 
@@ -193,6 +201,23 @@ The dataset ships with three starter rows and only one of them has boundaries ch
 is a smoke test, not a benchmark, until you add your own. To label a row: play the video in the app,
 note when the event really starts and ends, and append an entry. Ten careful rows are worth more
 than fifty careless ones.
+
+### Detect benchmark
+
+`bench/detect_ground_truth.json` labels every interval where each of 17 queries over the six sample
+videos is true, checked by eye at one frame per second, with close calls marked *acceptable* and the
+accepted readings for text queries. With the app running:
+
+```powershell
+.\.venv\Scripts\python.exe -m bench.detect --modes detect verified --label mine
+.\.venv\Scripts\python.exe -m bench.detect --modes detect --label no-vision --options '{\"vision_check\": false}'
+.\.venv\Scripts\python.exe -m bench.detect --compare bench\results\<run>.json bench\results\<other>.json
+```
+
+A returned clip is a hit when at least half of it lies inside a labelled interval, neutral inside an
+acceptable one, and a false positive otherwise; an interval is found when clips cover half of it or a
+second. Searches the benchmark creates are deleted afterwards. Don't restart the app during a run:
+a restart marks searches in progress as interrupted.
 
 ## Project layout
 

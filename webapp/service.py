@@ -11,7 +11,7 @@ import threading
 import time
 
 from video_retrieval.config import DATA_DIR
-from video_retrieval.detect_search import DETECT_STAGES, example_for
+from video_retrieval.detect_search import DETECT_STAGES, example_for, missed_candidate
 from video_retrieval.feedback_learning import Learner
 from video_retrieval.local_backend import LocalModels, capabilities, check_runtime, devices, installed_models, installed_names, use_models
 from video_retrieval.config import TEXT_EMBEDDING_MODEL
@@ -203,7 +203,8 @@ class Service:
         options = self._search_options(mode, options or {})
         search = self.library.create_search(video_id, {"query": query, "mode": mode, "options": options, "status": "queued"})
         if mode == "detect":
-            stages = list(DETECT_STAGES)
+            stages = [stage for stage in DETECT_STAGES
+                      if stage != "Checking results with the vision model" or options["vision_check"]]
         else:
             stages = [
                 stage for stage in SEARCH_STAGES
@@ -213,7 +214,9 @@ class Service:
             "search", video_id, query, stages,
             run=lambda job: self._run_search(job, search["id"]),
             on_finish=lambda job: self._search_finished(job, search["id"]),
-            alternate_stages={"Reading visible text": TEXT_STAGES},
+            # A Detect search asked to read text hands over to text reading, which starts by planning.
+            alternate_stages={"Reading visible text": TEXT_STAGES,
+                              **({"Planning query": TEXT_STAGES} if mode == "detect" else {})},
         )
         job.result = {"search_id": search["id"]}
         self.library.update_search(video_id, search["id"], job_id=job.id)
@@ -238,7 +241,51 @@ class Service:
         if mode == "detect":
             # How many frames the detector may examine, best-ranked shots first.
             options["max_frames"] = number("max_frames", 400, 50, 3000, int)
+            # Whether the vision model double-checks each result.
+            options["vision_check"] = bool(raw.get("vision_check", True))
+            if raw.get("plan") is not None:
+                options["plan"] = Service._detect_plan(raw["plan"])
         return options
+
+    @staticmethod
+    def _detect_plan(plan):
+        """A plan edited in the browser: known fields only, short strings, sensible counts."""
+        if not isinstance(plan, dict):
+            raise LibraryError("The plan must be an object.")
+
+        def text(key):
+            value = " ".join(str(plan.get(key) or "").split())
+            if len(value) > 200:
+                raise LibraryError(f"Keep {key} under 200 characters.")
+            return value
+
+        def texts(key):
+            values = plan.get(key) or []
+            if isinstance(values, str):
+                values = [part for part in values.split(";")]
+            if not isinstance(values, list):
+                raise LibraryError(f"{key} must be a list.")
+            cleaned = [" ".join(str(value).split()) for value in values if str(value).strip()]
+            if len(cleaned) > 4 or any(len(value) > 200 for value in cleaned):
+                raise LibraryError(f"Give at most four {key}, each under 200 characters.")
+            return cleaned
+
+        def count(key, low, high):
+            try:
+                value = int(plan.get(key) or low)
+            except (TypeError, ValueError):
+                raise LibraryError(f"{key} must be a whole number.")
+            if not low <= value <= high:
+                raise LibraryError(f"{key} must be between {low} and {high}.")
+            return value
+
+        edited = {"object": text("object"), "target": text("target"), "contrasts": texts("contrasts"),
+                  "min_count": count("min_count", 1, 20), "with_object": text("with_object"),
+                  "with_count": count("with_count", 0, 20), "action": text("action"),
+                  "action_contrasts": texts("action_contrasts")}
+        if not edited["object"] and not edited["action"]:
+            raise LibraryError("The plan needs something to detect or a motion to look for.")
+        return edited
 
     def _run_search(self, job, search_id):
         search = self.library.update_search(job.video_id, search_id, status="running", started_at=time.time())
@@ -254,7 +301,16 @@ class Service:
             with use_models(models, job.report, job.cancel_event):
                 result = detect_search(search["query"], pipeline.resources, output_root,
                                        max_frames=options.get("max_frames", 400), max_frames_per_match=8,
-                                       learner=self.learner, search_id=search_id)
+                                       learner=self.learner, search_id=search_id, plan=options.get("plan"),
+                                       vision_check=options.get("vision_check", True))
+            if result.get("route") == "text":
+                # Detection cannot read, so a request to read text is answered by text reading.
+                result = {**pipeline.retrieve(
+                    search["query"], reporter=job.report, cancel_event=job.cancel_event, run_verification=True,
+                    refine_boundaries=True, pro_min_confidence=options["min_confidence"],
+                    max_candidates=options["max_candidates"], output_root=str(output_root),
+                    include_evidence_map=True, final_frame_fps=1.0, max_frames_per_match=8,
+                ), "routed": {"to": "verified", "reason": "The request asks to read text, which detection cannot do."}}
             finished = time.time()
             self.library.update_search(job.video_id, search_id, status="done", result=result,
                                        finished_at=finished, elapsed=finished - search["started_at"])
@@ -288,13 +344,46 @@ class Service:
         if match_key not in known:
             raise LibraryError("That result is not part of this search.")
         feedback = dict(record.get("feedback") or {})
+        changes = {}
         if label is None:
             feedback.pop(match_key, None)
+            if match_key in (record.get("missed") or {}):
+                # Clearing a missed moment's mark forgets the moment too.
+                changes["missed"] = {key: value for key, value in record["missed"].items() if key != match_key}
         else:
             feedback[match_key] = label
-        self.library.update_search(video_id, search_id, feedback=feedback)
+        self.library.update_search(video_id, search_id, feedback=feedback, **changes)
         example = example_for(self.library.search_dir(video_id, search_id), match_key) if label else None
         self.learner.record(video_id, search_id, match_key, label, example)
+        return self.search(video_id, search_id)
+
+    def add_missed(self, video_id, search_id, start, end):
+        """Record a stretch the search should have found: kept as a result and learned from."""
+        record = self.library.get_search(video_id, search_id)
+        if record.get("mode") != "detect" or record.get("status") != "done":
+            raise LibraryError("Missed moments can only be added to a finished Detect search.")
+        if (record.get("result") or {}).get("routed"):
+            raise LibraryError("This search was answered by text reading, which does not learn from marks.")
+        try:
+            start, end = float(start), float(end)
+        except (TypeError, ValueError):
+            raise LibraryError("Give the start and end of the missed moment in seconds.")
+        duration = float(self.library.get(video_id).get("duration") or 0)
+        if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end and end - start >= 0.3):
+            raise LibraryError("The missed moment must end at least 0.3 seconds after it starts.")
+        if duration and end > duration + 0.5:
+            raise LibraryError("The missed moment ends after the video does.")
+        if end - start > 120:
+            raise LibraryError("Mark missed moments of up to two minutes at a time.")
+        search_dir = self.library.search_dir(video_id, search_id)
+        if not (search_dir / "detect_state.pkl").is_file():
+            raise LibraryError("This search has no saved state; run it again.")
+        candidate, example = missed_candidate(search_dir, start, end)
+        key = candidate["match_key"]
+        feedback = {**(record.get("feedback") or {}), key: "positive"}
+        missed = {**(record.get("missed") or {}), key: {"start": start, "end": end, "detected": candidate["detected"]}}
+        self.library.update_search(video_id, search_id, feedback=feedback, missed=missed)
+        self.learner.record(video_id, search_id, key, "positive", example)
         return self.search(video_id, search_id)
 
     def start_refine(self, video_id, search_id):
